@@ -165,7 +165,7 @@ def write_tensor(out_dict, name, w, n_layers, ebits, io_bits, xbits):
     out_dict[name + ".qs"] = s
 
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits):
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
