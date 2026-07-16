@@ -94,7 +94,7 @@ def should_skip(name, n_layers):
     return False
 
 
-def classify(name, n_layers):
+def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("_scale_inv") or name.endswith("_scale"):
         return "consumed"
     if should_skip(name, n_layers):
