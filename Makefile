@@ -1,4 +1,14 @@
-.PHONY: all glm portable test check cuda-test clean
+CC ?= gcc
+ARCH ?= native
+CFLAGS = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-function -Isrc
+LDFLAGS = -lm -fopenmp
 
-all glm portable test check cuda-test clean:
-	$(MAKE) -C c $@
+.PHONY: all clean m3
+
+all: m3
+
+m3: src/engine.c src/st.h src/json.h src/planar_kv.h
+	$(CC) $(CFLAGS) src/engine.c -o m3 $(LDFLAGS)
+
+clean:
+	rm -f m3

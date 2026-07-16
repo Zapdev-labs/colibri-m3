@@ -1,0 +1,922 @@
+/* colibri-m3 — original MiniMax-M3 streaming MoE engine
+ * Dense stack resident (int4/8). Routed experts streamed from disk with LRU.
+ * GQA + partial RoPE + SwiGLU-OAI + sigmoid router. Optional PlanarQuant KV.
+ * Zero runtime deps beyond libc + OpenMP. Target: big CPU boxes (AVX-512).
+ */
+#define _GNU_SOURCE
+#include <math.h>
+#include <omp.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
+#ifdef __AVX512F__
+#include <immintrin.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#include "json.h"
+#include "planar_kv.h"
+#include "st.h"
+
+/* ---------- config ---------- */
+typedef struct {
+    int hidden, layers, heads, kv_heads, head_dim, vocab;
+    int experts, topk, moe_inter, dense_inter, first_dense, n_shared;
+    int rotary_dim, gemma_norm, route_norm;
+    float eps, theta, router_scale, sw_alpha, sw_limit;
+    int eos;
+} Cfg;
+
+/* fmt: 0 f32, 1 int8+scale, 2 int4 packed+scale */
+typedef struct {
+    int fmt, O, I;
+    float *qf, *s;
+    int8_t *q8;
+    uint8_t *q4;
+} QT;
+
+typedef struct {
+    float *in_ln, *post_ln, *qn, *kn, *router, *router_bias;
+    QT q, k, v, o;
+    QT gate, up, down;       /* dense MLP */
+    QT sh_gate, sh_up, sh_down;
+    int sparse;
+} Layer;
+
+typedef struct {
+    int eid;
+    QT g, u, d;
+    uint8_t *slab;
+    uint64_t used;
+} ESlot;
+
+typedef struct {
+    Cfg c;
+    shards S;
+    int ebits, dbits, ecap;
+    QT embed, lm_head;
+    float *final_norm;
+    Layer *L;
+    ESlot **cache;
+    int *cn;
+    float **K, **V;
+    int8_t **Kq, **Vq;
+    float **Ks, **Vs;
+    int max_t, kv_i8, planar;
+    uint64_t clock, hits, miss;
+} Model;
+
+static float g_temp = 1.0f, g_topp = 0.95f;
+static int g_topk_samp = 40, g_planar_bits = 3;
+
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+static float *falloc(int64_t n) {
+    float *p = (float *)malloc((size_t)n * sizeof(float));
+    if (!p) {
+        fprintf(stderr, "OOM\n");
+        exit(1);
+    }
+    return p;
+}
+
+#ifdef __AVX512F__
+static inline float hsum512(__m512 v) {
+    return _mm512_reduce_add_ps(v);
+}
+static inline float dot_f(const float *a, const float *b, int n) {
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+    float s = hsum512(acc);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+static inline void axpy_f(float *y, const float *x, float w, int n) {
+    __m512 wv = _mm512_set1_ps(w);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 yv = _mm512_loadu_ps(y + i);
+        yv = _mm512_fmadd_ps(_mm512_loadu_ps(x + i), wv, yv);
+        _mm512_storeu_ps(y + i, yv);
+    }
+    for (; i < n; i++) y[i] += w * x[i];
+}
+#elif defined(__AVX2__)
+static inline float hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    __m128 sh = _mm_movehl_ps(lo, lo);
+    lo = _mm_add_ps(lo, sh);
+    sh = _mm_shuffle_ps(lo, lo, 1);
+    lo = _mm_add_ss(lo, sh);
+    return _mm_cvtss_f32(lo);
+}
+static inline float dot_f(const float *a, const float *b, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+    float s = hsum256(acc);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+static inline void axpy_f(float *y, const float *x, float w, int n) {
+    __m256 wv = _mm256_set1_ps(w);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 yv = _mm256_loadu_ps(y + i);
+        yv = _mm256_fmadd_ps(_mm256_loadu_ps(x + i), wv, yv);
+        _mm256_storeu_ps(y + i, yv);
+    }
+    for (; i < n; i++) y[i] += w * x[i];
+}
+#else
+static inline float dot_f(const float *a, const float *b, int n) {
+    float s = 0;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+static inline void axpy_f(float *y, const float *x, float w, int n) {
+    for (int i = 0; i < n; i++) y[i] += w * x[i];
+}
+#endif
+
+static inline float sigmoidf_(float x) { return 1.f / (1.f + expf(-x)); }
+static inline float swiglu(float x, float a, float lim) {
+    float g = x > lim ? lim : (x < -lim ? -lim : x);
+    return g * sigmoidf_(a * g);
+}
+
+static void rmsnorm(float *o, const float *x, const float *w, int D, float eps, int gemma) {
+    double ms = 0;
+    for (int i = 0; i < D; i++) ms += (double)x[i] * x[i];
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    if (gemma)
+        for (int i = 0; i < D; i++) o[i] = x[i] * r * (1.f + w[i]);
+    else
+        for (int i = 0; i < D; i++) o[i] = x[i] * r * w[i];
+}
+static void softmax(float *x, int n) {
+    float m = -1e30f;
+    for (int i = 0; i < n; i++)
+        if (x[i] > m) m = x[i];
+    float s = 0;
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - m);
+        s += x[i];
+    }
+    for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* Partial rotate-half RoPE on first rotary_dim channels */
+static void rope(float *x, int pos, float theta, int hd, int rd) {
+    if (rd <= 0 || rd > hd) rd = hd;
+    int h2 = rd / 2;
+    float tmp[256];
+    if (rd > 256) {
+        fprintf(stderr, "rotary_dim too large\n");
+        exit(1);
+    }
+    memcpy(tmp, x, (size_t)rd * sizeof(float));
+    for (int j = 0; j < h2; j++) {
+        float inv = powf(theta, -2.f * j / (float)rd);
+        float ang = pos * inv, c = cosf(ang), s = sinf(ang);
+        float x1 = tmp[j], x2 = tmp[j + h2];
+        x[j] = x1 * c - x2 * s;
+        x[j + h2] = x2 * c + x1 * s;
+    }
+}
+
+static void matmul_f(float *y, const float *x, const float *W, int S, int I, int O) {
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *w = W + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            y[(int64_t)s * O + o] = dot_f(x + (int64_t)s * I, w, I);
+        }
+    }
+}
+static void matmul_i8(float *y, const float *x, const int8_t *q, const float *sc, int S, int I, int O) {
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        float scale = sc[o];
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float a = 0;
+            for (int i = 0; i < I; i++) a += xs[i] * (float)w[i];
+            y[(int64_t)s * O + o] = a * scale;
+        }
+    }
+}
+static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *sc, int S, int I, int O) {
+    int rb = (I + 1) / 2;
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        float scale = sc[o];
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float a = 0;
+            int i = 0;
+            for (; i + 1 < I; i += 2) {
+                uint8_t b = w[i >> 1];
+                a += xs[i] * (float)((int)(b & 0xF) - 8) + xs[i + 1] * (float)((int)(b >> 4) - 8);
+            }
+            if (i < I) a += xs[i] * (float)((int)(w[i >> 1] & 0xF) - 8);
+            y[(int64_t)s * O + o] = a * scale;
+        }
+    }
+}
+static void matmul_qt(float *y, const float *x, QT *w, int S) {
+    if (w->fmt == 0) matmul_f(y, x, w->qf, S, w->I, w->O);
+    else if (w->fmt == 1) matmul_i8(y, x, w->q8, w->s, S, w->I, w->O);
+    else matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
+}
+
+static void qt_load(Model *m, const char *name, int O, int I, int bits, QT *t) {
+    char qs[512];
+    snprintf(qs, sizeof(qs), "%s.qs", name);
+    t->O = O;
+    t->I = I;
+    t->qf = NULL;
+    t->q8 = NULL;
+    t->q4 = NULL;
+    t->s = NULL;
+    if (st_has(&m->S, qs)) {
+        int64_t nb = st_nbytes(&m->S, name);
+        if (nb == (int64_t)O * I) {
+            t->fmt = 1;
+            t->q8 = (int8_t *)malloc((size_t)nb);
+            t->s = falloc(O);
+            st_read(&m->S, name, t->q8, nb);
+            st_read(&m->S, qs, t->s, (int64_t)O * 4);
+        } else {
+            t->fmt = 2;
+            t->q4 = (uint8_t *)malloc((size_t)nb);
+            t->s = falloc(O);
+            st_read(&m->S, name, t->q4, nb);
+            st_read(&m->S, qs, t->s, (int64_t)O * 4);
+        }
+        (void)bits;
+        return;
+    }
+    /* f32 fallback */
+    t->fmt = 0;
+    t->qf = falloc((int64_t)O * I);
+    st_read(&m->S, name, t->qf, (int64_t)O * I * 4);
+}
+
+static int gi(jval *r, const char *k) {
+    jval *v = json_get(r, k);
+    return v ? (int)v->num : 0;
+}
+static float gf(jval *r, const char *k, float d) {
+    jval *v = json_get(r, k);
+    return v ? (float)v->num : d;
+}
+
+static void load_cfg(Cfg *c, const char *snap) {
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/config.json", snap);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror(path);
+        exit(1);
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = (char *)malloc((size_t)n + 1);
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) {
+    }
+    b[n] = 0;
+    fclose(f);
+    char *ar = NULL;
+    jval *root = json_parse(b, &ar);
+    free(b);
+    jval *tc = json_get(root, "text_config");
+    jval *r = tc ? tc : root;
+    c->hidden = gi(r, "hidden_size");
+    c->layers = gi(r, "num_hidden_layers");
+    c->heads = gi(r, "num_attention_heads");
+    c->kv_heads = gi(r, "num_key_value_heads");
+    c->experts = gi(r, "num_experts");
+    if (!c->experts) c->experts = gi(r, "num_local_experts");
+    c->topk = gi(r, "num_experts_per_tok");
+    c->moe_inter = gi(r, "moe_intermediate_size");
+    if (!c->moe_inter) c->moe_inter = gi(r, "intermediate_size");
+    c->dense_inter = gi(r, "dense_intermediate_size");
+    if (!c->dense_inter) c->dense_inter = gi(r, "intermediate_size");
+    c->first_dense = gi(r, "first_k_dense_replace");
+    c->head_dim = gi(r, "head_dim");
+    if (!c->head_dim) c->head_dim = c->hidden / c->heads;
+    c->n_shared = gi(r, "num_shared_experts");
+    if (!c->n_shared) c->n_shared = 1;
+    c->vocab = gi(r, "vocab_size");
+    c->rotary_dim = gi(r, "rotary_dim");
+    if (!c->rotary_dim) c->rotary_dim = c->head_dim / 2;
+    c->eps = gf(r, "rms_norm_eps", 1e-6f);
+    c->theta = gf(r, "rope_theta", 5000000.f);
+    jval *rp = json_get(r, "rope_parameters");
+    if (rp) {
+        jval *th = json_get(rp, "rope_theta");
+        if (th) c->theta = (float)th->num;
+    }
+    c->router_scale = gf(r, "router_scaling_factor", 0.f);
+    if (c->router_scale == 0.f) c->router_scale = gf(r, "routed_scaling_factor", 2.f);
+    c->sw_alpha = gf(r, "swiglu_alpha", 1.702f);
+    c->sw_limit = gf(r, "swiglu_limit", 7.f);
+    jval *gn = json_get(r, "use_gemma_norm");
+    c->gemma_norm = (gn && gn->t == J_BOOL) ? gn->boolean : 1;
+    jval *rn = json_get(r, "route_norm");
+    c->route_norm = (rn && rn->t == J_BOOL) ? rn->boolean : 1;
+    jval *eo = json_get(r, "eos_token_id");
+    if (!eo) eo = json_get(root, "eos_token_id");
+    c->eos = eo ? (int)eo->num : 200020;
+    fprintf(stderr,
+            "[cfg] M3 H=%d L=%d heads=%d/%d experts=%d topk=%d rot=%d first_dense=%d\n",
+            c->hidden, c->layers, c->heads, c->kv_heads, c->experts, c->topk, c->rotary_dim,
+            c->first_dense);
+}
+
+static float *load_f32(Model *m, const char *name, int n) {
+    float *p = falloc(n);
+    st_read(&m->S, name, p, (int64_t)n * 4);
+    return p;
+}
+
+static void load_model(Model *m, const char *snap, int ebits, int dbits, int ecap, int max_t) {
+    memset(m, 0, sizeof(*m));
+    load_cfg(&m->c, snap);
+    st_init(&m->S, snap);
+    m->ebits = ebits;
+    m->dbits = dbits;
+    m->ecap = ecap;
+    m->max_t = max_t;
+    m->kv_i8 = getenv("KV_I8") ? atoi(getenv("KV_I8")) : 0;
+    m->planar = getenv("PLANAR_KV") ? atoi(getenv("PLANAR_KV")) : 0;
+    if (m->planar) m->kv_i8 = 1;
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    qt_load(m, "model.embed_tokens.weight", c->vocab, D, dbits, &m->embed);
+    if (st_has(&m->S, "lm_head.weight"))
+        qt_load(m, "lm_head.weight", c->vocab, D, dbits, &m->lm_head);
+    else
+        m->lm_head = m->embed;
+    m->final_norm = load_f32(m, "model.norm.weight", D);
+    m->L = (Layer *)calloc((size_t)c->layers, sizeof(Layer));
+    m->cache = (ESlot **)calloc((size_t)c->layers, sizeof(ESlot *));
+    m->cn = (int *)calloc((size_t)c->layers, sizeof(int));
+    char nm[384], nm2[384];
+    double t0 = now_s();
+    for (int i = 0; i < c->layers; i++) {
+        Layer *l = &m->L[i];
+        l->sparse = (i >= c->first_dense);
+        snprintf(nm, sizeof(nm), "model.layers.%d.input_layernorm.weight", i);
+        l->in_ln = load_f32(m, nm, D);
+        snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", i);
+        l->post_ln = load_f32(m, nm, D);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_proj.weight", i);
+        qt_load(m, nm, c->heads * c->head_dim, D, dbits, &l->q);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.k_proj.weight", i);
+        qt_load(m, nm, c->kv_heads * c->head_dim, D, dbits, &l->k);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.v_proj.weight", i);
+        qt_load(m, nm, c->kv_heads * c->head_dim, D, dbits, &l->v);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.o_proj.weight", i);
+        qt_load(m, nm, D, c->heads * c->head_dim, dbits, &l->o);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_norm.weight", i);
+        if (st_has(&m->S, nm)) l->qn = load_f32(m, nm, c->head_dim);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.k_norm.weight", i);
+        if (st_has(&m->S, nm)) l->kn = load_f32(m, nm, c->head_dim);
+        if (l->sparse) {
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", i);
+            l->router = load_f32(m, nm, c->experts * D);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.e_score_correction_bias", i);
+            if (!st_has(&m->S, nm))
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.expert_bias", i);
+            if (st_has(&m->S, nm))
+                l->router_bias = load_f32(m, nm, c->experts);
+            else {
+                l->router_bias = falloc(c->experts);
+                memset(l->router_bias, 0, (size_t)c->experts * sizeof(float));
+            }
+            int sI = c->moe_inter * c->n_shared;
+            snprintf(nm2, sizeof(nm2), "model.layers.%d.mlp.shared_experts.gate_proj.weight", i);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.shared_mlp.gate_proj.weight", i);
+            qt_load(m, st_has(&m->S, nm2) ? nm2 : nm, sI, D, dbits, &l->sh_gate);
+            snprintf(nm2, sizeof(nm2), "model.layers.%d.mlp.shared_experts.up_proj.weight", i);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.shared_mlp.up_proj.weight", i);
+            qt_load(m, st_has(&m->S, nm2) ? nm2 : nm, sI, D, dbits, &l->sh_up);
+            snprintf(nm2, sizeof(nm2), "model.layers.%d.mlp.shared_experts.down_proj.weight", i);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.shared_mlp.down_proj.weight", i);
+            qt_load(m, st_has(&m->S, nm2) ? nm2 : nm, D, sI, dbits, &l->sh_down);
+            m->cache[i] = (ESlot *)calloc((size_t)ecap, sizeof(ESlot));
+        } else {
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate_proj.weight", i);
+            qt_load(m, nm, c->dense_inter, D, dbits, &l->gate);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.up_proj.weight", i);
+            qt_load(m, nm, c->dense_inter, D, dbits, &l->up);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.down_proj.weight", i);
+            qt_load(m, nm, D, c->dense_inter, dbits, &l->down);
+        }
+        if ((i + 1) % 10 == 0)
+            fprintf(stderr, "[load] layer %d/%d  RSS-ish elapsed %.1fs\n", i + 1, c->layers, now_s() - t0);
+    }
+    int64_t slot = (int64_t)c->kv_heads * max_t * c->head_dim;
+    if (m->kv_i8) {
+        m->Kq = (int8_t **)calloc((size_t)c->layers, sizeof(int8_t *));
+        m->Vq = (int8_t **)calloc((size_t)c->layers, sizeof(int8_t *));
+        m->Ks = (float **)calloc((size_t)c->layers, sizeof(float *));
+        m->Vs = (float **)calloc((size_t)c->layers, sizeof(float *));
+        for (int i = 0; i < c->layers; i++) {
+            m->Kq[i] = (int8_t *)malloc((size_t)slot);
+            m->Vq[i] = (int8_t *)malloc((size_t)slot);
+            m->Ks[i] = falloc((int64_t)c->kv_heads * max_t);
+            m->Vs[i] = falloc((int64_t)c->kv_heads * max_t);
+        }
+    } else {
+        m->K = (float **)calloc((size_t)c->layers, sizeof(float *));
+        m->V = (float **)calloc((size_t)c->layers, sizeof(float *));
+        for (int i = 0; i < c->layers; i++) {
+            m->K[i] = falloc(slot);
+            m->V[i] = falloc(slot);
+        }
+    }
+    fprintf(stderr, "[load] ready in %.1fs | expert cache %d/layer | kv_%s\n", now_s() - t0, ecap,
+            m->planar ? "planar" : (m->kv_i8 ? "i8" : "f32"));
+}
+
+static void expert_load(Model *m, int layer, int eid, ESlot *s) {
+    Cfg *c = &m->c;
+    char nm[3][320];
+    const char *suf[3] = {"gate_proj", "up_proj", "down_proj"};
+    for (int k = 0; k < 3; k++)
+        snprintf(nm[k], sizeof(nm[k]), "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, suf[k]);
+    s->eid = eid;
+    qt_load(m, nm[0], c->moe_inter, c->hidden, m->ebits, &s->g);
+    qt_load(m, nm[1], c->moe_inter, c->hidden, m->ebits, &s->u);
+    qt_load(m, nm[2], c->hidden, c->moe_inter, m->ebits, &s->d);
+    s->used = ++m->clock;
+}
+
+static ESlot *expert_get(Model *m, int layer, int eid) {
+    ESlot *Sl = m->cache[layer];
+    int n = m->cn[layer];
+    for (int z = 0; z < n; z++)
+        if (Sl[z].eid == eid) {
+            m->hits++;
+            Sl[z].used = ++m->clock;
+            return &Sl[z];
+        }
+    m->miss++;
+    ESlot *dst;
+    if (n < m->ecap) {
+        dst = &Sl[m->cn[layer]++];
+        memset(dst, 0, sizeof(*dst));
+    } else {
+        int lru = 0;
+        for (int z = 1; z < n; z++)
+            if (Sl[z].used < Sl[lru].used) lru = z;
+        dst = &Sl[lru];
+        free(dst->g.q8);
+        free(dst->g.q4);
+        free(dst->g.s);
+        free(dst->g.qf);
+        free(dst->u.q8);
+        free(dst->u.q4);
+        free(dst->u.s);
+        free(dst->u.qf);
+        free(dst->d.q8);
+        free(dst->d.q4);
+        free(dst->d.s);
+        free(dst->d.qf);
+        memset(dst, 0, sizeof(*dst));
+    }
+    expert_load(m, layer, eid, dst);
+    return dst;
+}
+
+static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos0, float *out) {
+    Cfg *c = &m->c;
+    int H = c->heads, Hkv = c->kv_heads, hd = c->head_dim, nrep = H / Hkv;
+    float scale = 1.f / sqrtf((float)hd);
+    int64_t qsz = (int64_t)S * H * hd, kv = (int64_t)S * Hkv * hd;
+    float *Q = falloc(qsz), *Kp = falloc(kv), *Vp = falloc(kv);
+    matmul_qt(Q, x, &l->q, S);
+    matmul_qt(Kp, x, &l->k, S);
+    matmul_qt(Vp, x, &l->v, S);
+    for (int s = 0; s < S; s++) {
+        int pos = pos0 + s;
+        for (int h = 0; h < H; h++) {
+            float *qh = Q + (int64_t)s * H * hd + (int64_t)h * hd;
+            if (l->qn) rmsnorm(qh, qh, l->qn, hd, c->eps, 0);
+            rope(qh, pos, c->theta, hd, c->rotary_dim);
+        }
+        for (int kh = 0; kh < Hkv; kh++) {
+            float *kk = Kp + (int64_t)s * Hkv * hd + (int64_t)kh * hd;
+            float *vv = Vp + (int64_t)s * Hkv * hd + (int64_t)kh * hd;
+            if (l->kn) rmsnorm(kk, kk, l->kn, hd, c->eps, 0);
+            rope(kk, pos, c->theta, hd, c->rotary_dim);
+            int64_t off = ((int64_t)kh * m->max_t + pos) * hd;
+            int64_t soff = (int64_t)kh * m->max_t + pos;
+            if (m->kv_i8) {
+                if (m->planar) {
+                    m->Ks[layer][soff] = planar_kv_encode(kk, m->Kq[layer] + off, hd, g_planar_bits);
+                    m->Vs[layer][soff] = planar_kv_encode(vv, m->Vq[layer] + off, hd, g_planar_bits);
+                } else {
+                    float mx = 1e-8f;
+                    for (int i = 0; i < hd; i++) {
+                        float a = fabsf(kk[i]);
+                        if (a > mx) mx = a;
+                    }
+                    m->Ks[layer][soff] = mx / 127.f;
+                    float inv = 1.f / m->Ks[layer][soff];
+                    for (int i = 0; i < hd; i++) m->Kq[layer][off + i] = (int8_t)lrintf(kk[i] * inv);
+                    mx = 1e-8f;
+                    for (int i = 0; i < hd; i++) {
+                        float a = fabsf(vv[i]);
+                        if (a > mx) mx = a;
+                    }
+                    m->Vs[layer][soff] = mx / 127.f;
+                    inv = 1.f / m->Vs[layer][soff];
+                    for (int i = 0; i < hd; i++) m->Vq[layer][off + i] = (int8_t)lrintf(vv[i] * inv);
+                }
+            } else {
+                memcpy(m->K[layer] + off, kk, (size_t)hd * sizeof(float));
+                memcpy(m->V[layer] + off, vv, (size_t)hd * sizeof(float));
+            }
+        }
+    }
+    float *ctx = falloc(qsz);
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int s = 0; s < S; s++)
+        for (int h = 0; h < H; h++) {
+            int pos = pos0 + s, kvh = h / nrep, nt = pos + 1;
+            const float *qv = Q + (int64_t)s * H * hd + (int64_t)h * hd;
+            float *sc = (float *)malloc((size_t)nt * sizeof(float));
+            for (int t = 0; t < nt; t++) {
+                if (m->kv_i8) {
+                    int64_t off = ((int64_t)kvh * m->max_t + t) * hd;
+                    int64_t soff = (int64_t)kvh * m->max_t + t;
+                    if (m->planar)
+                        sc[t] = planar_kv_dot_q(qv, m->Kq[layer] + off, m->Ks[layer][soff], hd, g_planar_bits) * scale;
+                    else {
+                        float a = 0;
+                        for (int i = 0; i < hd; i++) a += qv[i] * (float)m->Kq[layer][off + i];
+                        sc[t] = a * m->Ks[layer][soff] * scale;
+                    }
+                } else {
+                    const float *kvv = m->K[layer] + ((int64_t)kvh * m->max_t + t) * hd;
+                    sc[t] = dot_f(qv, kvv, hd) * scale;
+                }
+            }
+            softmax(sc, nt);
+            float *cx = ctx + (int64_t)s * H * hd + (int64_t)h * hd;
+            memset(cx, 0, (size_t)hd * sizeof(float));
+            for (int t = 0; t < nt; t++) {
+                if (m->kv_i8) {
+                    int64_t off = ((int64_t)kvh * m->max_t + t) * hd;
+                    int64_t soff = (int64_t)kvh * m->max_t + t;
+                    if (m->planar) {
+                        float tmp[256];
+                        planar_kv_decode(tmp, m->Vq[layer] + off, m->Vs[layer][soff], hd, g_planar_bits);
+                        axpy_f(cx, tmp, sc[t], hd);
+                    } else {
+                        for (int i = 0; i < hd; i++)
+                            cx[i] += sc[t] * m->Vs[layer][soff] * (float)m->Vq[layer][off + i];
+                    }
+                } else {
+                    const float *vv = m->V[layer] + ((int64_t)kvh * m->max_t + t) * hd;
+                    axpy_f(cx, vv, sc[t], hd);
+                }
+            }
+            free(sc);
+        }
+    matmul_qt(out, ctx, &l->o, S);
+    free(Q);
+    free(Kp);
+    free(Vp);
+    free(ctx);
+}
+
+static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    int I = c->dense_inter;
+    float *g = falloc((int64_t)S * I), *u = falloc((int64_t)S * I);
+    matmul_qt(g, x, &l->gate, S);
+    matmul_qt(u, x, &l->up, S);
+    for (int64_t i = 0; i < (int64_t)S * I; i++) g[i] = swiglu(g[i], c->sw_alpha, c->sw_limit) * u[i];
+    matmul_qt(out, g, &l->down, S);
+    free(g);
+    free(u);
+}
+
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->experts, K = c->topk, I = c->moe_inter, sI = I * c->n_shared;
+    float *logit = falloc(E), *choice = falloc(E);
+    int *idxs = (int *)malloc((size_t)S * K * sizeof(int));
+    float *ws = (float *)malloc((size_t)S * K * sizeof(float));
+    memset(out, 0, (size_t)S * D * sizeof(float));
+    for (int s = 0; s < S; s++) {
+        matmul_f(logit, x + (int64_t)s * D, l->router, 1, D, E);
+        for (int e = 0; e < E; e++) {
+            logit[e] = sigmoidf_(logit[e]);
+            choice[e] = logit[e] + l->router_bias[e];
+        }
+        int *idx = idxs + (int64_t)s * K;
+        float *w = ws + (int64_t)s * K;
+        for (int kk = 0; kk < K; kk++) {
+            int best = -1;
+            float bv = -1e30f;
+            for (int e = 0; e < E; e++) {
+                int taken = 0;
+                for (int j = 0; j < kk; j++)
+                    if (idx[j] == e) {
+                        taken = 1;
+                        break;
+                    }
+                if (!taken && choice[e] > bv) {
+                    bv = choice[e];
+                    best = e;
+                }
+            }
+            idx[kk] = best;
+            w[kk] = logit[best];
+        }
+        if (c->route_norm) {
+            float sm = 1e-20f;
+            for (int kk = 0; kk < K; kk++) sm += w[kk];
+            for (int kk = 0; kk < K; kk++) w[kk] /= sm;
+        }
+        for (int kk = 0; kk < K; kk++) w[kk] *= c->router_scale;
+    }
+    /* batch-union experts */
+    unsigned char *seen = (unsigned char *)calloc((size_t)E, 1);
+    int *uniq = (int *)malloc((size_t)E * sizeof(int));
+    int nu = 0;
+    for (int s = 0; s < S; s++)
+        for (int kk = 0; kk < K; kk++) {
+            int e = idxs[(int64_t)s * K + kk];
+            if (!seen[e]) {
+                seen[e] = 1;
+                uniq[nu++] = e;
+            }
+        }
+    float *xg = falloc((int64_t)S * D), *gg = falloc((int64_t)S * I), *uu = falloc((int64_t)S * I),
+          *hh = falloc((int64_t)S * D);
+    int *rows = (int *)malloc((size_t)S * sizeof(int));
+    float *rw = (float *)malloc((size_t)S * sizeof(float));
+    for (int j = 0; j < nu; j++) {
+        int eid = uniq[j];
+        ESlot *e = expert_get(m, layer, eid);
+        int nr = 0;
+        for (int s = 0; s < S; s++)
+            for (int kk = 0; kk < K; kk++)
+                if (idxs[(int64_t)s * K + kk] == eid) {
+                    rows[nr] = s;
+                    rw[nr] = ws[(int64_t)s * K + kk];
+                    nr++;
+                    break;
+                }
+        for (int r = 0; r < nr; r++) memcpy(xg + (int64_t)r * D, x + (int64_t)rows[r] * D, (size_t)D * sizeof(float));
+        matmul_qt(gg, xg, &e->g, nr);
+        matmul_qt(uu, xg, &e->u, nr);
+        for (int64_t z = 0; z < (int64_t)nr * I; z++) gg[z] = swiglu(gg[z], c->sw_alpha, c->sw_limit) * uu[z];
+        matmul_qt(hh, gg, &e->d, nr);
+        for (int r = 0; r < nr; r++) {
+            float *os = out + (int64_t)rows[r] * D, w = rw[r], *hr = hh + (int64_t)r * D;
+            for (int d = 0; d < D; d++) os[d] += w * hr[d];
+        }
+    }
+    float *sg = falloc((int64_t)S * sI), *su = falloc((int64_t)S * sI);
+    matmul_qt(sg, x, &l->sh_gate, S);
+    matmul_qt(su, x, &l->sh_up, S);
+    for (int64_t z = 0; z < (int64_t)S * sI; z++) sg[z] = swiglu(sg[z], c->sw_alpha, c->sw_limit) * su[z];
+    matmul_qt(hh, sg, &l->sh_down, S);
+    for (int64_t z = 0; z < (int64_t)S * D; z++) out[z] += hh[z];
+    free(logit);
+    free(choice);
+    free(idxs);
+    free(ws);
+    free(seen);
+    free(uniq);
+    free(xg);
+    free(gg);
+    free(uu);
+    free(hh);
+    free(rows);
+    free(rw);
+    free(sg);
+    free(su);
+}
+
+static void layer_fwd(Model *m, int li, float *x, int S, int pos0, float *nrm, float *tmp) {
+    Layer *l = &m->L[li];
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    for (int s = 0; s < S; s++) rmsnorm(nrm + (int64_t)s * D, x + (int64_t)s * D, l->in_ln, D, c->eps, c->gemma_norm);
+    attention(m, l, li, nrm, S, pos0, tmp);
+    for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
+    for (int s = 0; s < S; s++) rmsnorm(nrm + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps, c->gemma_norm);
+    if (l->sparse) moe(m, l, li, nrm, S, tmp);
+    else dense_mlp(m, l, nrm, S, tmp);
+    for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
+}
+
+static void embed_tok(Model *m, int tok, float *x) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    if (m->embed.fmt == 0) {
+        memcpy(x, m->embed.qf + (int64_t)tok * D, (size_t)D * sizeof(float));
+        return;
+    }
+    /* dequant one row */
+    if (m->embed.fmt == 1) {
+        const int8_t *q = m->embed.q8 + (int64_t)tok * D;
+        float s = m->embed.s[tok];
+        for (int i = 0; i < D; i++) x[i] = (float)q[i] * s;
+    } else {
+        int rb = (D + 1) / 2;
+        const uint8_t *q = m->embed.q4 + (int64_t)tok * rb;
+        float s = m->embed.s[tok];
+        for (int i = 0; i < D; i++) {
+            uint8_t b = q[i >> 1];
+            int nib = (i & 1) ? (b >> 4) : (b & 0xF);
+            x[i] = (float)(nib - 8) * s;
+        }
+    }
+}
+
+static int sample_logits(const float *lo, int V) {
+    if (g_temp <= 1e-5f) {
+        int best = 0;
+        float bv = lo[0];
+        for (int i = 1; i < V; i++)
+            if (lo[i] > bv) {
+                bv = lo[i];
+                best = i;
+            }
+        return best;
+    }
+    float *p = falloc(V);
+    float mx = lo[0];
+    for (int i = 1; i < V; i++)
+        if (lo[i] > mx) mx = lo[i];
+    float invt = 1.f / g_temp;
+    double sum = 0;
+    for (int i = 0; i < V; i++) {
+        p[i] = expf((lo[i] - mx) * invt);
+        sum += p[i];
+    }
+    for (int i = 0; i < V; i++) p[i] /= (float)sum;
+    /* top-k */
+    if (g_topk_samp > 0 && g_topk_samp < V) {
+        int *idx = (int *)malloc((size_t)V * sizeof(int));
+        for (int i = 0; i < V; i++) idx[i] = i;
+        for (int a = 0; a < g_topk_samp; a++) {
+            int bi = a;
+            for (int b = a + 1; b < V; b++)
+                if (p[idx[b]] > p[idx[bi]]) bi = b;
+            int tmp = idx[a];
+            idx[a] = idx[bi];
+            idx[bi] = tmp;
+        }
+        for (int i = g_topk_samp; i < V; i++) p[idx[i]] = 0;
+        double s2 = 0;
+        for (int i = 0; i < g_topk_samp; i++) s2 += p[idx[i]];
+        for (int i = 0; i < g_topk_samp; i++) p[idx[i]] /= (float)s2;
+        free(idx);
+    }
+    /* nucleus */
+    if (g_topp > 0 && g_topp < 1.f) {
+        int *idx = (int *)malloc((size_t)V * sizeof(int));
+        for (int i = 0; i < V; i++) idx[i] = i;
+        for (int a = 0; a < V; a++) {
+            int bi = a;
+            for (int b = a + 1; b < V; b++)
+                if (p[idx[b]] > p[idx[bi]]) bi = b;
+            int tmp = idx[a];
+            idx[a] = idx[bi];
+            idx[bi] = tmp;
+        }
+        double cum = 0;
+        int keep = V;
+        for (int i = 0; i < V; i++) {
+            cum += p[idx[i]];
+            if (cum >= g_topp) {
+                keep = i + 1;
+                break;
+            }
+        }
+        for (int i = keep; i < V; i++) p[idx[i]] = 0;
+        double s2 = 0;
+        for (int i = 0; i < keep; i++) s2 += p[idx[i]];
+        for (int i = 0; i < keep; i++) p[idx[i]] /= (float)s2;
+        free(idx);
+    }
+    double u = (double)rand() / RAND_MAX, cum = 0;
+    for (int i = 0; i < V; i++) {
+        cum += p[i];
+        if (cum >= u) {
+            free(p);
+            return i;
+        }
+    }
+    free(p);
+    return V - 1;
+}
+
+static int run_gen(Model *m, const int *prompt, int np, int max_new) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *x = falloc(D), *nrm = falloc(D), *tmp = falloc(D), *logits = falloc(c->vocab);
+    double t0 = now_s();
+    for (int i = 0; i < np; i++) {
+        embed_tok(m, prompt[i], x);
+        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, i, nrm, tmp);
+        if ((i + 1) == np || ((i + 1) % 32) == 0)
+            fprintf(stderr, "\r[prefill] %d/%d", i + 1, np);
+    }
+    fprintf(stderr, "\n[prefill] done in %.2fs\n", now_s() - t0);
+    rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+    matmul_qt(logits, nrm, &m->lm_head, 1);
+    int pos = np;
+    t0 = now_s();
+    int emitted = 0;
+    for (int t = 0; t < max_new; t++) {
+        int tok = sample_logits(logits, c->vocab);
+        printf("%d\n", tok);
+        fflush(stdout);
+        emitted++;
+        if (tok == c->eos) break;
+        embed_tok(m, tok, x);
+        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, pos, nrm, tmp);
+        pos++;
+        rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+        matmul_qt(logits, nrm, &m->lm_head, 1);
+    }
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits + m->miss);
+    fprintf(stderr, "[stat] %d tok in %.2fs (%.2f tok/s) | expert hit %.1f%%\n", emitted, dt,
+            emitted / (dt > 1e-6 ? dt : 1e-6), tot ? 100.0 * m->hits / tot : 0.0);
+    free(x);
+    free(nrm);
+    free(tmp);
+    free(logits);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *snap = getenv("SNAP");
+    if (!snap) {
+        fprintf(stderr, "usage: SNAP=<model_dir> ./m3 [cache] [ebits] [dbits] [ctx]\n");
+        return 1;
+    }
+    int cap = argc > 1 ? atoi(argv[1]) : 128;
+    int ebits = argc > 2 ? atoi(argv[2]) : 4;
+    int dbits = argc > 3 ? atoi(argv[3]) : 8;
+    int ctx = argc > 4 ? atoi(argv[4]) : 4096;
+    if (getenv("TEMP")) g_temp = (float)atof(getenv("TEMP"));
+    if (getenv("TOPP")) g_topp = (float)atof(getenv("TOPP"));
+    if (getenv("TOPK")) g_topk_samp = atoi(getenv("TOPK"));
+    if (getenv("PLANAR_BITS")) g_planar_bits = atoi(getenv("PLANAR_BITS"));
+    srand((unsigned)time(NULL));
+
+    Model m;
+    load_model(&m, snap, ebits, dbits, cap, ctx);
+    fprintf(stderr, "READY\n");
+
+    /* stdin protocol: first line = max_new, second line = space-separated prompt token ids */
+    char line[1 << 20];
+    if (!fgets(line, sizeof(line), stdin)) return 0;
+    int max_new = atoi(line);
+    if (max_new <= 0) max_new = 128;
+    if (!fgets(line, sizeof(line), stdin)) return 0;
+    int prompt[8192], np = 0;
+    char *p = line, *end = NULL;
+    while (np < 8192) {
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        prompt[np++] = (int)v;
+        p = end;
+    }
+    if (np < 1) {
+        fprintf(stderr, "empty prompt\n");
+        return 2;
+    }
+    fprintf(stderr, "[run] prompt=%d tokens, max_new=%d\n", np, max_new);
+    return run_gen(&m, prompt, np, max_new);
+}

@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""colibri-m3 CLI — chat / run / convert / serve (no web UI)."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.join(ROOT, "m3")
+CONVERT = os.path.join(ROOT, "tools", "convert.py")
+
+
+def eng() -> str:
+    if not os.path.isfile(BIN):
+        sys.exit("engine not built — run: make -j")
+    return BIN
+
+
+def model_dir(a: argparse.Namespace) -> str:
+    d = a.model or os.environ.get("COLI_MODEL")
+    if not d:
+        sys.exit("set --model or COLI_MODEL")
+    return os.path.abspath(d)
+
+
+def base_env(a: argparse.Namespace) -> dict[str, str]:
+    e = os.environ.copy()
+    e["SNAP"] = model_dir(a)
+    e.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 8))
+    e.setdefault("OMP_PLACES", "cores")
+    e.setdefault("OMP_PROC_BIND", "close")
+    if a.planar:
+        e["PLANAR_KV"] = "1"
+    if a.temp is not None:
+        e["TEMP"] = str(a.temp)
+    if a.topp is not None:
+        e["TOPP"] = str(a.topp)
+    if a.topk is not None:
+        e["TOPK"] = str(a.topk)
+    return e
+
+
+def load_tokenizer(model: str):
+    try:
+        from tokenizers import Tokenizer
+    except ImportError:
+        sys.exit("pip install tokenizers  (needed for chat/run)")
+    path = os.path.join(model, "tokenizer.json")
+    if not os.path.isfile(path):
+        sys.exit(f"missing {path}")
+    return Tokenizer.from_file(path)
+
+
+def chat_template(messages: list[dict[str, str]], tok) -> str:
+    # Minimal MiniMax-style chat wrap if no jinja applied by tokenizers
+    parts = []
+    for m in messages:
+        role, content = m["role"], m["content"]
+        parts.append(f"<|{role}|>{content}")
+    parts.append("<|assistant|>")
+    return "".join(parts)
+
+
+def run_engine(a: argparse.Namespace, prompt_ids: list[int], max_new: int) -> list[int]:
+    e = base_env(a)
+    cmd = [eng(), str(a.cap), str(a.ebits), str(a.dbits), str(a.ctx)]
+    payload = f"{max_new}\n" + " ".join(map(str, prompt_ids)) + "\n"
+    p = subprocess.Popen(
+        cmd,
+        env=e,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None if a.verbose else subprocess.PIPE,
+        text=True,
+    )
+    out, err = p.communicate(payload)
+    if p.returncode != 0:
+        if err:
+            sys.stderr.write(err)
+        sys.exit(p.returncode or 1)
+    ids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit() or (line.startswith("-") and line[1:].isdigit()):
+            ids.append(int(line))
+    return ids
+
+
+def cmd_build(_: argparse.Namespace) -> None:
+    sys.exit(subprocess.call(["make", "-C", ROOT, "-j", str(os.cpu_count() or 4)]))
+
+
+def cmd_convert(a: argparse.Namespace) -> None:
+    if not os.path.isfile(CONVERT):
+        sys.exit("missing tools/convert.py")
+    out = a.model or a.outdir
+    if not out:
+        sys.exit("--model/--outdir required")
+    cmd = [sys.executable, CONVERT, "--outdir", out, "--ebits", str(a.ebits), "--io-bits", str(a.dbits)]
+    if a.repo:
+        cmd += ["--repo", a.repo]
+    elif a.indir:
+        cmd += ["--indir", a.indir]
+    else:
+        sys.exit("pass --repo or --indir")
+    sys.exit(subprocess.call(cmd))
+
+
+def cmd_run(a: argparse.Namespace) -> None:
+    model = model_dir(a)
+    tok = load_tokenizer(model)
+    text = a.prompt if a.prompt else sys.stdin.read()
+    ids = tok.encode(text).ids
+    print(f"# prompt_tokens={len(ids)}", file=sys.stderr)
+    out = run_engine(a, ids, a.maxn)
+    print(tok.decode(out))
+
+
+def cmd_chat(a: argparse.Namespace) -> None:
+    model = model_dir(a)
+    tok = load_tokenizer(model)
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": a.system or "You are a helpful assistant. Your name is MiniMax-M3."}
+    ]
+    print("colibri-m3 — MiniMax-M3 streaming engine (Ctrl-C to quit)\n")
+    while True:
+        try:
+            user = input("› ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not user:
+            continue
+        messages.append({"role": "user", "content": user})
+        # Prefer tokenizer chat template when present
+        try:
+            prompt = tok.decode(
+                tok.encode(
+                    chat_template(messages, tok),
+                    add_special_tokens=False,
+                ).ids
+            )
+            ids = tok.encode(chat_template(messages, tok)).ids
+        except Exception:
+            ids = tok.encode(chat_template(messages, tok)).ids
+        out = run_engine(a, ids, a.maxn)
+        text = tok.decode(out)
+        print(text)
+        print()
+        messages.append({"role": "assistant", "content": text})
+
+
+def cmd_serve(a: argparse.Namespace) -> None:
+    # Minimal OpenAI-compatible server using stdlib only + engine subprocess per request
+    # (persistent engine would be better; v1 keeps deps at zero beyond tokenizers)
+    try:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    except ImportError:
+        sys.exit("http.server unavailable")
+    model = model_dir(a)
+    tok = load_tokenizer(model)
+
+    class H(BaseHTTPRequestHandler):
+        def _json(self, code: int, obj: dict) -> None:
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/v1/models"):
+                self._json(200, {"object": "list", "data": [{"id": "minimax-m3", "object": "model"}]})
+            else:
+                self._json(404, {"error": "not found"})
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self._json(404, {"error": "not found"})
+                return
+            n = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(n))
+            msgs = req.get("messages") or []
+            max_new = int(req.get("max_tokens") or req.get("max_completion_tokens") or a.maxn)
+            prompt = chat_template(msgs, tok)
+            ids = tok.encode(prompt).ids
+            out = run_engine(a, ids, max_new)
+            text = tok.decode(out)
+            self._json(
+                200,
+                {
+                    "id": "coli-m3",
+                    "object": "chat.completion",
+                    "model": "minimax-m3",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                },
+            )
+
+        def log_message(self, fmt: str, *args) -> None:
+            sys.stderr.write("HTTP " + (fmt % args) + "\n")
+
+    host, port = a.host, a.port
+    print(f"serving on http://{host}:{port}  model={model}", flush=True)
+    ThreadingHTTPServer((host, port), H).serve_forever()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="coli", description="colibri-m3 — MiniMax-M3 on disk-streamed experts")
+    ap.add_argument("--model", default=os.environ.get("COLI_MODEL"))
+    ap.add_argument("--cap", type=int, default=128, help="expert LRU slots per MoE layer")
+    ap.add_argument("--ebits", type=int, default=4)
+    ap.add_argument("--dbits", type=int, default=8)
+    ap.add_argument("--ctx", type=int, default=4096)
+    ap.add_argument("--maxn", type=int, default=256)
+    ap.add_argument("--planar", action="store_true", help="PlanarQuant-style KV cache")
+    ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--topp", type=float, default=0.95)
+    ap.add_argument("--topk", type=int, default=40)
+    ap.add_argument("--verbose", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("build")
+    p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("convert")
+    p.add_argument("--repo", default="MiniMaxAI/MiniMax-M3")
+    p.add_argument("--indir")
+    p.add_argument("--outdir")
+    p.set_defaults(func=cmd_convert)
+
+    p = sub.add_parser("run")
+    p.add_argument("prompt", nargs="?", default="")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("chat")
+    p.add_argument("--system", default=None)
+    p.set_defaults(func=cmd_chat)
+
+    p = sub.add_parser("serve")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8080)
+    p.set_defaults(func=cmd_serve)
+
+    a = ap.parse_args()
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()
