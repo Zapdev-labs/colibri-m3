@@ -31,6 +31,14 @@ typedef struct {
     int rotary_dim, gemma_norm, route_norm;
     float eps, theta, router_scale, sw_alpha, sw_limit;
     int eos;
+    /* MSA (MiniMax Sparse Attention) config — parsed from sparse_attention_config */
+    int idx_dim;       /* sparse_index_dim, default 128 */
+    int idx_heads;     /* sparse_num_index_heads, default = kv_heads */
+    int topk_blk;      /* sparse_topk_blocks, default 16 */
+    int blk_size;      /* sparse_block_size, default 128 */
+    int init_blk;      /* sparse_init_block, default 0 (always-selected sink block) */
+    int local_blk;     /* sparse_local_block, default 1 (local window blocks forced) */
+    int *sparse_freq;  /* [layers] — 1 = MSA, 0 = dense GQA */
 } Cfg;
 
 /* fmt: 0 f32, 1 int8+scale, 2 int4 packed+scale */
@@ -47,6 +55,10 @@ typedef struct {
     QT gate, up, down;       /* dense MLP */
     QT sh_gate, sh_up, sh_down;
     int sparse;
+    /* MSA indexer tensors (loaded only for layers where sparse_attention_freq[i]==1) */
+    QT iq, ik;              /* index_q_proj [idx_heads*idx_dim, hidden], index_k_proj [idx_dim, hidden] */
+    float *iqn, *ikn;       /* index_q_norm [idx_dim], index_k_norm [idx_dim] (f32) */
+    int msa;                /* 1 = use MSA sparse attention, 0 = dense GQA */
 } Layer;
 
 typedef struct {
@@ -70,6 +82,9 @@ typedef struct {
     float **Ks, **Vs;
     int max_t, kv_i8, planar;
     uint64_t clock, hits, miss;
+    /* MSA indexer K cache: per-layer [max_t * idx_dim] f32 */
+    float **Kidx;
+    int msa_layers;  /* count of layers with MSA enabled */
 } Model;
 
 static float g_temp = 1.0f, g_topp = 0.95f;
@@ -345,10 +360,49 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *eo = json_get(r, "eos_token_id");
     if (!eo) eo = json_get(root, "eos_token_id");
     c->eos = eo ? (int)eo->num : 200020;
+
+    /* MSA: parse sparse_attention_config (from HF config) */
+    c->idx_dim = 0;
+    c->idx_heads = 0;
+    c->topk_blk = 16;
+    c->blk_size = 128;
+    c->init_blk = 0;
+    c->local_blk = 1;
+    c->sparse_freq = NULL;
+    jval *sac = json_get(r, "sparse_attention_config");
+    if (sac) {
+        c->idx_dim = gi(sac, "sparse_index_dim");
+        c->idx_heads = gi(sac, "sparse_num_index_heads");
+        c->topk_blk = gi(sac, "sparse_topk_blocks");
+        c->blk_size = gi(sac, "sparse_block_size");
+        c->init_blk = gi(sac, "sparse_init_block");
+        c->local_blk = gi(sac, "sparse_local_block");
+        jval *freq = json_get(sac, "sparse_attention_freq");
+        if (freq && freq->t == J_ARR && freq->len > 0) {
+            c->sparse_freq = (int *)calloc((size_t)c->layers, sizeof(int));
+            int ncopy = freq->len < c->layers ? freq->len : c->layers;
+            for (int i = 0; i < ncopy; i++) c->sparse_freq[i] = (int)freq->kids[i]->num;
+        }
+    }
+    /* defaults if sparse_attention_config absent */
+    if (!c->idx_dim) c->idx_dim = 128;
+    if (!c->idx_heads) c->idx_heads = c->kv_heads;
+    if (!c->topk_blk) c->topk_blk = 16;
+    if (!c->blk_size) c->blk_size = 128;
+    if (c->init_blk < 0) c->init_blk = 0;
+    if (c->local_blk < 0) c->local_blk = 1;
+    int msa_count = 0;
+    if (c->sparse_freq) {
+        for (int i = 0; i < c->layers; i++) msa_count += c->sparse_freq[i] ? 1 : 0;
+    }
     fprintf(stderr,
             "[cfg] M3 H=%d L=%d heads=%d/%d experts=%d topk=%d rot=%d first_dense=%d\n",
             c->hidden, c->layers, c->heads, c->kv_heads, c->experts, c->topk, c->rotary_dim,
             c->first_dense);
+    fprintf(stderr,
+            "[cfg] MSA idx_dim=%d idx_heads=%d topk_blk=%d blk_size=%d init=%d local=%d msa_layers=%d/%d\n",
+            c->idx_dim, c->idx_heads, c->topk_blk, c->blk_size, c->init_blk, c->local_blk,
+            msa_count, c->layers);
 }
 
 static float *load_f32(Model *m, const char *name, int n) {
@@ -400,6 +454,20 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
         if (st_has(&m->S, nm)) l->qn = load_f32(m, nm, c->head_dim);
         snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.k_norm.weight", i);
         if (st_has(&m->S, nm)) l->kn = load_f32(m, nm, c->head_dim);
+        /* MSA: load index_q_proj, index_k_proj, index_q_norm, index_k_norm for
+         * layers where sparse_attention_freq[i] == 1 (layers 3-59 in MiniMax M3). */
+        l->msa = (c->sparse_freq && c->sparse_freq[i]) ? 1 : 0;
+        if (l->msa) {
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_q_proj.weight", i);
+            qt_load(m, nm, c->idx_heads * c->idx_dim, D, dbits, &l->iq);
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_k_proj.weight", i);
+            qt_load(m, nm, c->idx_dim, D, dbits, &l->ik);
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_q_norm.weight", i);
+            if (st_has(&m->S, nm)) l->iqn = load_f32(m, nm, c->idx_dim);
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_k_norm.weight", i);
+            if (st_has(&m->S, nm)) l->ikn = load_f32(m, nm, c->idx_dim);
+            m->msa_layers++;
+        }
         if (l->sparse) {
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", i);
             l->router = load_f32(m, nm, c->experts * D);
@@ -454,8 +522,18 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
             m->V[i] = falloc(slot);
         }
     }
-    fprintf(stderr, "[load] ready in %.1fs | expert cache %d/layer | kv_%s\n", now_s() - t0, ecap,
-            m->planar ? "planar" : (m->kv_i8 ? "i8" : "f32"));
+    /* MSA indexer K cache: per-layer [max_t * idx_dim] f32 (one 128-dim row per KV
+     * position; shared across all index heads — the K projection is single-head). */
+    if (m->msa_layers > 0) {
+        m->Kidx = (float **)calloc((size_t)c->layers, sizeof(float *));
+        int64_t idx_slot = (int64_t)max_t * c->idx_dim;
+        for (int i = 0; i < c->layers; i++) {
+            if (m->L[i].msa) m->Kidx[i] = falloc(idx_slot);
+        }
+    }
+    fprintf(stderr, "[load] ready in %.1fs | expert cache %d/layer | kv_%s | msa_layers=%d\n",
+            now_s() - t0, ecap,
+            m->planar ? "planar" : (m->kv_i8 ? "i8" : "f32"), m->msa_layers);
 }
 
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
@@ -508,7 +586,274 @@ static ESlot *expert_get(Model *m, int layer, int eid) {
     return dst;
 }
 
+/* ---------- MSA (MiniMax Sparse Attention) ----------
+ * Ported from llama.cpp-minimax-m3-rq: msa_block_mask_op (top-k partial_sort with
+ * position-anchored local-force bias) + the per-layer ggml_flash_attn_ext dispatch.
+ * Pure C, f32 KV path. The indexer projects Q/K to 128-dim, applies per-head RMSNorm,
+ * then computes a max score over each 128-token KV block. Top-16 blocks are selected
+ * per GQA group (init_block=0 + local_block=1 are always forced), then a block-sparse
+ * softmax attention runs over the gathered tokens. sparse_attention_freq[layer]==0
+ * routes through the dense GQA path (layers 0-2 in MiniMax M3).
+ */
+
+/* Compute per-block max-scores from indexer Q and the indexer K cache.
+ * iq:       [idx_heads * idx_dim]  — indexer Q for the current token (RoPE/norm already applied)
+ * Kidx:     [max_t * idx_dim]      — indexer K cache, one 128-dim row per KV position
+ * pos:      current query position (0-based); only tokens 0..pos are visible (causal)
+ * scores:   output [idx_heads * n_blocks]
+ */
+static void msa_indexer_scores(const float *iq, const float *Kidx, int pos,
+                               int idx_heads, int idx_dim, int max_t,
+                               int blk_size, int n_blocks, float *scores) {
+    for (int h = 0; h < idx_heads; h++) {
+        const float *iqh = iq + (int64_t)h * idx_dim;
+        float *outh = scores + (int64_t)h * n_blocks;
+        for (int b = 0; b < n_blocks; b++) {
+            int bstart = b * blk_size;
+            int bend = bstart + blk_size;
+            if (bend > pos + 1) bend = pos + 1;     /* causal: token pos inclusive */
+            if (bstart >= max_t) bstart = max_t;     /* beyond cache */
+            float mx = -1e30f;
+            for (int t = bstart; t < bend; t++) {
+                const float *kt = Kidx + (int64_t)t * idx_dim;
+                float s = dot_f(iqh, kt, idx_dim);
+                if (s > mx) mx = s;
+            }
+            outh[b] = (bend > bstart) ? mx : -1e30f;
+        }
+    }
+}
+
+/* Top-K block selection per GQA group with init_block + local_block forced.
+ * scores:   [n_blocks] per-block max-score for one index head
+ * selected: output [topk] — selected block indices (ascending order not guaranteed;
+ *           forced blocks come first, then top-scoring non-forced blocks).
+ * Returns the number of valid selected blocks (== topk unless n_blocks < topk).
+ */
+static int msa_topk_select(const float *scores, int n_blocks, int topk,
+                           int init_blk, int pos, int blk_size, int local_blks,
+                           int *selected) {
+    char forced[8192];
+    if (n_blocks > (int)sizeof(forced)) n_blocks = (int)sizeof(forced); /* safety */
+    memset(forced, 0, (size_t)n_blocks);
+    int local_blk = pos / blk_size;
+    if (init_blk >= 0 && init_blk < n_blocks) forced[init_blk] = 1;
+    for (int l = 0; l < local_blks; l++) {
+        int b = local_blk - l;
+        if (b >= 0 && b < n_blocks) forced[b] = 1;
+    }
+    int ns = 0;
+    /* forced blocks first */
+    for (int b = 0; b < n_blocks && ns < topk; b++) {
+        if (forced[b]) selected[ns++] = b;
+    }
+    /* fill remaining slots with highest-scoring non-forced blocks (selection sort) */
+    while (ns < topk) {
+        int best = -1;
+        float bv = -1e30f;
+        for (int b = 0; b < n_blocks; b++) {
+            if (!forced[b] && scores[b] > bv) {
+                bv = scores[b];
+                best = b;
+            }
+        }
+        if (best < 0) break;      /* fewer than topk selectable blocks (small ctx) */
+        forced[best] = 1;
+        selected[ns++] = best;
+    }
+    /* pad with -1 if n_blocks < topk */
+    while (ns < topk) selected[ns++] = -1;
+    return ns;
+}
+
+/* Read one K (or V) row from the KV cache into a dense f32 buffer.
+ * Handles f32, i8, and planar-i8 cache formats. */
+static inline void msa_kv_read(Model *m, int layer, int kv_head, int t,
+                               float *out, int hd, int is_v) {
+    int64_t off = ((int64_t)kv_head * m->max_t + t) * hd;
+    int64_t soff = (int64_t)kv_head * m->max_t + t;
+    if (m->kv_i8) {
+        int8_t *q = is_v ? m->Vq[layer] : m->Kq[layer];
+        float *sc = is_v ? m->Vs[layer] : m->Ks[layer];
+        if (m->planar) {
+            planar_kv_decode(out, q + off, sc[soff], hd, g_planar_bits);
+        } else {
+            float s = sc[soff];
+            for (int i = 0; i < hd; i++) out[i] = (float)q[off + i] * s;
+        }
+    } else {
+        float *p = is_v ? m->V[layer] : m->K[layer];
+        memcpy(out, p + off, (size_t)hd * sizeof(float));
+    }
+}
+
+/* Block-sparse softmax attention for one GQA group, single query token.
+ * Q:        [n_q_in_group * head_dim]  — Q vectors for the n_q_in_group heads in this group
+ * selected: [topk]                     — selected block indices (from msa_topk_select)
+ * out:      [n_q_in_group * head_dim]  — attention output (zeroed on entry)
+ */
+static void msa_group_attention(Model *m, int layer, int kv_head,
+                                const float *Q, const int *selected, int topk,
+                                int n_q_in_group, int head_dim, int pos,
+                                int blk_size, float scale, float *out) {
+    /* Gather token indices from selected blocks (respecting causality) */
+    int gather_idx[4096];
+    int ngather = 0;
+    for (int i = 0; i < topk; i++) {
+        int b = selected[i];
+        if (b < 0) continue;
+        int bstart = b * blk_size;
+        int bend = bstart + blk_size;
+        if (bend > pos + 1) bend = pos + 1;
+        for (int t = bstart; t < bend; t++) {
+            if (ngather < (int)(sizeof(gather_idx) / sizeof(gather_idx[0])))
+                gather_idx[ngather++] = t;
+        }
+    }
+    if (ngather == 0) return;
+
+    float *kbuf = (float *)malloc((size_t)ngather * head_dim * sizeof(float));
+    float *vbuf = (float *)malloc((size_t)ngather * head_dim * sizeof(float));
+    for (int i = 0; i < ngather; i++) {
+        msa_kv_read(m, layer, kv_head, gather_idx[i], kbuf + (int64_t)i * head_dim, head_dim, 0);
+        msa_kv_read(m, layer, kv_head, gather_idx[i], vbuf + (int64_t)i * head_dim, head_dim, 1);
+    }
+
+    for (int h = 0; h < n_q_in_group; h++) {
+        const float *qh = Q + (int64_t)h * head_dim;
+        float *sc = (float *)malloc((size_t)ngather * sizeof(float));
+        float mx = -1e30f;
+        for (int i = 0; i < ngather; i++) {
+            sc[i] = dot_f(qh, kbuf + (int64_t)i * head_dim, head_dim) * scale;
+            if (sc[i] > mx) mx = sc[i];
+        }
+        float sum = 0.f;
+        for (int i = 0; i < ngather; i++) {
+            sc[i] = expf(sc[i] - mx);
+            sum += sc[i];
+        }
+        float inv = sum > 0.f ? 1.f / sum : 0.f;
+        float *oh = out + (int64_t)h * head_dim;
+        memset(oh, 0, (size_t)head_dim * sizeof(float));
+        for (int i = 0; i < ngather; i++)
+            axpy_f(oh, vbuf + (int64_t)i * head_dim, sc[i] * inv, head_dim);
+        free(sc);
+    }
+    free(kbuf);
+    free(vbuf);
+}
+
+/* Full MSA attention pass for one token (S must be 1).
+ * Projects Q/K/V (+ indexer Q/K), applies QK norm + partial RoPE, stores K/V and
+ * indexer K in cache, selects top-16 blocks per GQA group, and runs block-sparse
+ * softmax attention over the gathered tokens. */
+static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int pos0, float *out) {
+    Cfg *c = &m->c;
+    int H = c->heads, Hkv = c->kv_heads, hd = c->head_dim;
+    int idx_heads = c->idx_heads, idx_dim = c->idx_dim;
+    int blk_size = c->blk_size, topk_blk = c->topk_blk;
+    int n_q_in_group = H / Hkv;
+    float scale = 1.f / sqrtf((float)hd);
+    /* This engine is single-token; MSA batch path is not exercised. */
+    if (S != 1) { /* fall back to dense for batched calls (not used by run_gen) */
+        /* delegate to dense path by computing full attention inline */
+    }
+
+    /* 1. QKV projection (same matrices as dense path) */
+    int64_t qsz = (int64_t)S * H * hd, kv = (int64_t)S * Hkv * hd;
+    float *Q = falloc(qsz), *Kp = falloc(kv), *Vp = falloc(kv);
+    matmul_qt(Q, x, &l->q, S);
+    matmul_qt(Kp, x, &l->k, S);
+    matmul_qt(Vp, x, &l->v, S);
+
+    int pos = pos0;     /* S==1 */
+    /* 2. QK norm + partial RoPE + K/V cache store (mirrors dense path) */
+    for (int h = 0; h < H; h++) {
+        float *qh = Q + (int64_t)h * hd;
+        if (l->qn) rmsnorm(qh, qh, l->qn, hd, c->eps, 0);
+        rope(qh, pos, c->theta, hd, c->rotary_dim);
+    }
+    for (int kh = 0; kh < Hkv; kh++) {
+        float *kk = Kp + (int64_t)kh * hd;
+        float *vv = Vp + (int64_t)kh * hd;
+        if (l->kn) rmsnorm(kk, kk, l->kn, hd, c->eps, 0);
+        rope(kk, pos, c->theta, hd, c->rotary_dim);
+        int64_t off = ((int64_t)kh * m->max_t + pos) * hd;
+        int64_t soff = (int64_t)kh * m->max_t + pos;
+        if (m->kv_i8) {
+            if (m->planar) {
+                m->Ks[layer][soff] = planar_kv_encode(kk, m->Kq[layer] + off, hd, g_planar_bits);
+                m->Vs[layer][soff] = planar_kv_encode(vv, m->Vq[layer] + off, hd, g_planar_bits);
+            } else {
+                float mx = 1e-8f;
+                for (int i = 0; i < hd; i++) { float a = fabsf(kk[i]); if (a > mx) mx = a; }
+                m->Ks[layer][soff] = mx / 127.f;
+                float inv = 1.f / m->Ks[layer][soff];
+                for (int i = 0; i < hd; i++) m->Kq[layer][off + i] = (int8_t)lrintf(kk[i] * inv);
+                mx = 1e-8f;
+                for (int i = 0; i < hd; i++) { float a = fabsf(vv[i]); if (a > mx) mx = a; }
+                m->Vs[layer][soff] = mx / 127.f;
+                inv = 1.f / m->Vs[layer][soff];
+                for (int i = 0; i < hd; i++) m->Vq[layer][off + i] = (int8_t)lrintf(vv[i] * inv);
+            }
+        } else {
+            memcpy(m->K[layer] + off, kk, (size_t)hd * sizeof(float));
+            memcpy(m->V[layer] + off, vv, (size_t)hd * sizeof(float));
+        }
+    }
+
+    /* 3. Indexer forward: project to idx_dim, per-head RMSNorm, partial RoPE, cache K */
+    float *iq = falloc((int64_t)idx_heads * idx_dim);
+    float *ikt = falloc(idx_dim);
+    matmul_qt(iq, x, &l->iq, 1);    /* [idx_heads * idx_dim] */
+    matmul_qt(ikt, x, &l->ik, 1);   /* [idx_dim] */
+    for (int h = 0; h < idx_heads; h++) {
+        float *iqh = iq + (int64_t)h * idx_dim;
+        if (l->iqn) rmsnorm(iqh, iqh, l->iqn, idx_dim, c->eps, 0);
+        rope(iqh, pos, c->theta, idx_dim, c->rotary_dim);
+    }
+    if (l->ikn) rmsnorm(ikt, ikt, l->ikn, idx_dim, c->eps, 0);
+    rope(ikt, pos, c->theta, idx_dim, c->rotary_dim);
+    memcpy(m->Kidx[layer] + (int64_t)pos * idx_dim, ikt, (size_t)idx_dim * sizeof(float));
+
+    /* 4. Per-GQA-group block selection + sparse attention */
+    int n_blocks = (m->max_t + blk_size - 1) / blk_size;
+    float *scores = falloc((int64_t)idx_heads * n_blocks);
+    msa_indexer_scores(iq, m->Kidx[layer], pos, idx_heads, idx_dim,
+                       m->max_t, blk_size, n_blocks, scores);
+
+    float *ctx = falloc(qsz);
+    memset(ctx, 0, (size_t)qsz * sizeof(float));
+    for (int g = 0; g < Hkv; g++) {
+        int selected[64];   /* topk_blk max (16) */
+        msa_topk_select(scores + (int64_t)g * n_blocks, n_blocks, topk_blk,
+                        c->init_blk, pos, blk_size, c->local_blk, selected);
+        const float *Qg = Q + (int64_t)g * n_q_in_group * hd;
+        float *outg = ctx + (int64_t)g * n_q_in_group * hd;
+        msa_group_attention(m, layer, g, Qg, selected, topk_blk,
+                            n_q_in_group, hd, pos, blk_size, scale, outg);
+    }
+
+    /* 5. Output projection */
+    matmul_qt(out, ctx, &l->o, 1);
+
+    if (getenv("MSA_DEBUG") && getenv("MSA_DEBUG")[0] == '1') {
+        fprintf(stderr, "[layer %d] sparse (16 blocks)\n", layer);
+    }
+
+    free(Q); free(Kp); free(Vp); free(ctx); free(iq); free(ikt); free(scores);
+}
+
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos0, float *out) {
+    /* MSA routing: sparse_attention_freq[layer]==1 (and single-token, f32 or i8 KV)
+     * takes the block-sparse path; layers 0-2 (freq==0) use dense GQA. */
+    if (l->msa && S == 1) {
+        attention_msa(m, l, layer, x, S, pos0, out);
+        return;
+    }
+    if (getenv("MSA_DEBUG") && getenv("MSA_DEBUG")[0] == '1') {
+        fprintf(stderr, "[layer %d] dense\n", layer);
+    }
     Cfg *c = &m->c;
     int H = c->heads, Hkv = c->kv_heads, hd = c->head_dim, nrep = H / Hkv;
     float scale = 1.f / sqrtf((float)hd);
@@ -981,6 +1326,18 @@ static int dry_run(const char *snap) {
         dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
         snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.k_norm.weight", i);
         dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+        /* MSA indexer tensors (only expected for layers where sparse_attention_freq[i]==1).
+         * index_q_proj/index_k_proj are int4 (need .qs); index_q_norm/index_k_norm are f32. */
+        if (c.sparse_freq && c.sparse_freq[i]) {
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_q_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_k_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_q_norm.weight", i);
+            dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.index_k_norm.weight", i);
+            dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+        }
         if (i >= c.first_dense) {
             /* MoE layer: router, bias, shared expert, routed experts */
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", i);
@@ -1026,6 +1383,7 @@ static int dry_run(const char *snap) {
     return 1;
 }
 
+#ifndef TESTING
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) {
@@ -1072,3 +1430,4 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[run] prompt=%d tokens, max_new=%d\n", np, max_new);
     return run_gen(&m, prompt, np, max_new);
 }
+#endif /* TESTING */
