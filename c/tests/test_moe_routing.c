@@ -234,7 +234,8 @@ static void test_shared_expert_always_dispatched(void) {
      * predictable: sh_gate[r, r] = 1, sh_up[r, r] = 1, sh_down[r, r] = 1
      * (with sh_gate/sh_up as [sI, D], sh_down as [D, sI]).
      * Then matmul(sh_gate, x)[r] = x[r], matmul(sh_up, x)[r] = x[r],
-     * swiglu(x[r]) * x[r], and matmul(sh_down, .)[r] = swiglu(x[r]) * x[r]. */
+     * swiglu(gate=x[r], up=x[r]) = (up+1)*glu (HF _apply_gate), and
+     * matmul(sh_down, .)[r] = swiglu(x[r], x[r]). */
     for (int i = 0; i < sI * D; i++) { l->sh_gate.qf[i] = 0.0f; l->sh_up.qf[i] = 0.0f; }
     for (int r = 0; r < sI && r < D; r++) {
         l->sh_gate.qf[(int64_t)r * D + r] = 1.0f;
@@ -268,10 +269,11 @@ static void test_shared_expert_always_dispatched(void) {
     /* Shared expert path with identity weights:
      *   sg = sh_gate @ x  -> sg[r] = x[r] = 1.0 (for r < sI)
      *   su = sh_up   @ x  -> su[r] = x[r] = 1.0
-     *   swiglu(1.0, alpha=1.702, lim=7.0) * 1.0 = swiglu(1.0) ≈ 0.8458
-     *   hh = sh_down @ sg' -> hh[r] = swiglu(1.0) * 1.0 (for r < sI)
-     * So out[r] = swiglu(1.0) for r < sI. */
-    float expected = swiglu(1.0f, c.sw_alpha, c.sw_limit);
+     *   swiglu(gate=1.0, up=1.0, alpha=1.702, lim=7.0) = (1.0+1.0)*sigmoid(1.702)
+     *                                                   ≈ 1.6916  (HF _apply_gate)
+     *   hh = sh_down @ sg' -> hh[r] = swiglu(1.0, 1.0) (for r < sI)
+     * So out[r] = swiglu(1.0, 1.0) for r < sI. */
+    float expected = swiglu(1.0f, 1.0f, c.sw_alpha, c.sw_limit);
     int shared_ran = 0;
     for (int r = 0; r < sI && r < D; r++) {
         if (fabsf(out[r] - expected) < 1e-4) shared_ran = 1;

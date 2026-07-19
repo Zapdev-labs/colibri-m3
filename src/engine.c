@@ -168,9 +168,21 @@ static inline void axpy_f(float *y, const float *x, float w, int n) {
 #endif
 
 static inline float sigmoidf_(float x) { return 1.f / (1.f + expf(-x)); }
-static inline float swiglu(float x, float a, float lim) {
-    float g = x > lim ? lim : (x < -lim ? -lim : x);
-    return g * sigmoidf_(a * g);
+
+/* SwiGLUOAI activation matching HF MiniMaxM3VLDenseMLP._apply_gate /
+ * MiniMaxM3VLExperts._apply_gate exactly:
+ *   gate = gate.clamp(max=lim)            (asymmetric: upper-only clamp)
+ *   up   = up.clamp(min=-lim, max=lim)    (symmetric clamp on up)
+ *   glu  = gate * sigmoid(gate * alpha)
+ *   out  = (up + 1.0) * glu
+ * The +1.0 multiplier on `up` and the asymmetric (max-only) gate clamp are
+ * what distinguish SwiGLUOAI from a plain clamp(gate)*sigmoid(alpha*gate)*up.
+ * Reference: transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py. */
+static inline float swiglu(float gate, float up, float a, float lim) {
+    float g = gate > lim ? lim : gate;                      /* clamp(max=lim) */
+    float u = up > lim ? lim : (up < -lim ? -lim : up);     /* clamp([-lim,lim]) */
+    float glu = g * sigmoidf_(a * g);
+    return (u + 1.0f) * glu;
 }
 
 static void rmsnorm(float *o, const float *x, const float *w, int D, float eps, int gemma) {
@@ -1002,7 +1014,7 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     float *g = falloc((int64_t)S * I), *u = falloc((int64_t)S * I);
     matmul_qt(g, x, &l->gate, S);
     matmul_qt(u, x, &l->up, S);
-    for (int64_t i = 0; i < (int64_t)S * I; i++) g[i] = swiglu(g[i], c->sw_alpha, c->sw_limit) * u[i];
+    for (int64_t i = 0; i < (int64_t)S * I; i++) g[i] = swiglu(g[i], u[i], c->sw_alpha, c->sw_limit);
     matmul_qt(out, g, &l->down, S);
     free(g);
     free(u);
@@ -1092,7 +1104,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int r = 0; r < nr; r++) memcpy(xg + (int64_t)r * D, x + (int64_t)rows[r] * D, (size_t)D * sizeof(float));
         matmul_qt(gg, xg, &e->g, nr);
         matmul_qt(uu, xg, &e->u, nr);
-        for (int64_t z = 0; z < (int64_t)nr * I; z++) gg[z] = swiglu(gg[z], c->sw_alpha, c->sw_limit) * uu[z];
+        for (int64_t z = 0; z < (int64_t)nr * I; z++) gg[z] = swiglu(gg[z], uu[z], c->sw_alpha, c->sw_limit);
         matmul_qt(hh, gg, &e->d, nr);
         for (int r = 0; r < nr; r++) {
             float *os = out + (int64_t)rows[r] * D, w = rw[r], *hr = hh + (int64_t)r * D;
@@ -1102,7 +1114,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *sg = falloc((int64_t)S * sI), *su = falloc((int64_t)S * sI);
     matmul_qt(sg, x, &l->sh_gate, S);
     matmul_qt(su, x, &l->sh_up, S);
-    for (int64_t z = 0; z < (int64_t)S * sI; z++) sg[z] = swiglu(sg[z], c->sw_alpha, c->sw_limit) * su[z];
+    for (int64_t z = 0; z < (int64_t)S * sI; z++) sg[z] = swiglu(sg[z], su[z], c->sw_alpha, c->sw_limit);
     matmul_qt(hh, sg, &l->sh_down, S);
     for (int64_t z = 0; z < (int64_t)S * D; z++) out[z] += hh[z];
     free(logit);
