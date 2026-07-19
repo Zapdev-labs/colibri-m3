@@ -222,6 +222,25 @@ static void matmul_f(float *y, const float *x, const float *W, int S, int I, int
         }
     }
 }
+
+/* INT8 KV cache quantize/dequantize helpers — symmetric per-row scaling.
+ * Extracted so unit tests (VAL-CORR-026) can exercise the round-trip without
+ * driving a full attention pass. scale = max(|x|) / 127; q = round(x / scale). */
+static inline float kv_quantize_i8(const float *x, int8_t *q, int n) {
+    float mx = 1e-8f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > mx) mx = a;
+    }
+    float scale = mx / 127.f;
+    float inv = 1.f / scale;
+    for (int i = 0; i < n; i++) q[i] = (int8_t)lrintf(x[i] * inv);
+    return scale;
+}
+static inline void kv_dequantize_i8(float *out, const int8_t *q, float scale, int n) {
+    for (int i = 0; i < n; i++) out[i] = (float)q[i] * scale;
+}
+
 static void matmul_i8(float *y, const float *x, const int8_t *q, const float *sc, int S, int I, int O) {
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
@@ -254,6 +273,41 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
         }
     }
 }
+
+/* Group-scaled int4 matmul: sc is [O * ngroups] where ngroups = ceil(I/gs).
+ * Each (output row o, input group g) has its own scale — used by VAL-CORR-008
+ * to exercise the group-scaled (fmt=4, gs=128) kernel variant. The per-row
+ * matmul_i4 above is the special case gs=I. */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4,
+                              const float *sc, int S, int I, int O, int gs) {
+    int rb = (I + 1) / 2;
+    int ng = (I + gs - 1) / gs;
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const float *sco = sc + (int64_t)o * ng;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float a = 0;
+            for (int g = 0; g < ng; g++) {
+                int gstart = g * gs;
+                int gend = gstart + gs;
+                if (gend > I) gend = I;
+                float ga = 0;
+                int i = gstart;
+                for (; i + 1 < gend; i += 2) {
+                    uint8_t b = w[i >> 1];
+                    ga += xs[i] * (float)((int)(b & 0xF) - 8) +
+                          xs[i + 1] * (float)((int)(b >> 4) - 8);
+                }
+                if (i < gend) ga += xs[i] * (float)((int)(w[i >> 1] & 0xF) - 8);
+                a += ga * sco[g];
+            }
+            y[(int64_t)s * O + o] = a;
+        }
+    }
+}
+
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
     if (w->fmt == 0) matmul_f(y, x, w->qf, S, w->I, w->O);
     else if (w->fmt == 1) matmul_i8(y, x, w->q8, w->s, S, w->I, w->O);
@@ -881,22 +935,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos0, 
                     m->Ks[layer][soff] = planar_kv_encode(kk, m->Kq[layer] + off, hd, g_planar_bits);
                     m->Vs[layer][soff] = planar_kv_encode(vv, m->Vq[layer] + off, hd, g_planar_bits);
                 } else {
-                    float mx = 1e-8f;
-                    for (int i = 0; i < hd; i++) {
-                        float a = fabsf(kk[i]);
-                        if (a > mx) mx = a;
-                    }
-                    m->Ks[layer][soff] = mx / 127.f;
-                    float inv = 1.f / m->Ks[layer][soff];
-                    for (int i = 0; i < hd; i++) m->Kq[layer][off + i] = (int8_t)lrintf(kk[i] * inv);
-                    mx = 1e-8f;
-                    for (int i = 0; i < hd; i++) {
-                        float a = fabsf(vv[i]);
-                        if (a > mx) mx = a;
-                    }
-                    m->Vs[layer][soff] = mx / 127.f;
-                    inv = 1.f / m->Vs[layer][soff];
-                    for (int i = 0; i < hd; i++) m->Vq[layer][off + i] = (int8_t)lrintf(vv[i] * inv);
+                    m->Ks[layer][soff] = kv_quantize_i8(kk, m->Kq[layer] + off, hd);
+                    m->Vs[layer][soff] = kv_quantize_i8(vv, m->Vq[layer] + off, hd);
                 }
             } else {
                 memcpy(m->K[layer] + off, kk, (size_t)hd * sizeof(float));
@@ -968,6 +1008,47 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     free(u);
 }
 
+/* MiniMax M3 MoE router (sigmoid + e_score_correction_bias + route_norm + top-K).
+ * Extracted from moe() so unit tests (VAL-CORR-012) can exercise the router
+ * without driving a full MoE forward pass. Reference: HF MiniMaxM3VLTopKRouter.
+ *   x:      [D] hidden state for one token
+ *   router: [E*D] f32 router weight (E output rows, D input dims)
+ *   bias:   [E] f32 e_score_correction_bias
+ *   idx:    [K] output selected expert indices (sorted by score desc within forced order)
+ *   w:      [K] output router weights (post-normalization, post-router_scale)
+ *   logit, choice: scratch buffers of size E
+ */
+static void moe_router(int *idx, float *w, const float *x, const float *router,
+                       const float *bias, int D, int E, int K, int route_norm,
+                       float router_scale, float *logit, float *choice) {
+    matmul_f(logit, x, router, 1, D, E);
+    for (int e = 0; e < E; e++) {
+        logit[e] = sigmoidf_(logit[e]);        /* sigmoid scoring */
+        choice[e] = logit[e] + bias[e];        /* + e_score_correction_bias for selection */
+    }
+    for (int kk = 0; kk < K; kk++) {
+        int best = -1;
+        float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            int taken = 0;
+            for (int j = 0; j < kk; j++)
+                if (idx[j] == e) { taken = 1; break; }
+            if (!taken && choice[e] > bv) {
+                bv = choice[e];
+                best = e;
+            }
+        }
+        idx[kk] = best;
+        w[kk] = logit[best];                   /* weight = sigmoid(logit), NOT sigmoid+bias */
+    }
+    if (route_norm) {
+        float sm = 1e-20f;
+        for (int kk = 0; kk < K; kk++) sm += w[kk];
+        for (int kk = 0; kk < K; kk++) w[kk] /= sm;
+    }
+    for (int kk = 0; kk < K; kk++) w[kk] *= router_scale;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->experts, K = c->topk, I = c->moe_inter, sI = I * c->n_shared;
@@ -976,37 +1057,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *ws = (float *)malloc((size_t)S * K * sizeof(float));
     memset(out, 0, (size_t)S * D * sizeof(float));
     for (int s = 0; s < S; s++) {
-        matmul_f(logit, x + (int64_t)s * D, l->router, 1, D, E);
-        for (int e = 0; e < E; e++) {
-            logit[e] = sigmoidf_(logit[e]);
-            choice[e] = logit[e] + l->router_bias[e];
-        }
-        int *idx = idxs + (int64_t)s * K;
-        float *w = ws + (int64_t)s * K;
-        for (int kk = 0; kk < K; kk++) {
-            int best = -1;
-            float bv = -1e30f;
-            for (int e = 0; e < E; e++) {
-                int taken = 0;
-                for (int j = 0; j < kk; j++)
-                    if (idx[j] == e) {
-                        taken = 1;
-                        break;
-                    }
-                if (!taken && choice[e] > bv) {
-                    bv = choice[e];
-                    best = e;
-                }
-            }
-            idx[kk] = best;
-            w[kk] = logit[best];
-        }
-        if (c->route_norm) {
-            float sm = 1e-20f;
-            for (int kk = 0; kk < K; kk++) sm += w[kk];
-            for (int kk = 0; kk < K; kk++) w[kk] /= sm;
-        }
-        for (int kk = 0; kk < K; kk++) w[kk] *= c->router_scale;
+        moe_router(idxs + (int64_t)s * K, ws + (int64_t)s * K,
+                   x + (int64_t)s * D, l->router, l->router_bias,
+                   D, E, K, c->route_norm, c->router_scale, logit, choice);
     }
     /* batch-union experts */
     unsigned char *seen = (unsigned char *)calloc((size_t)E, 1);
