@@ -13,14 +13,60 @@ import tempfile
 
 import numpy as np
 
+# Tensors to skip entirely (vision/mtp/nextn heads not used by the M3 text engine).
+# NOTE: `indexer` matches the literal substring "indexer" (a separate HF module),
+# NOT "index_q_proj" / "index_k_proj" — those MSA indexer tensors are kept and
+# classified as attn/f32 below.
 SKIP_RE = re.compile(r"(indexer|eh_proj|enorm|hnorm|shared_head|mtp|nextn|vision|visual)")
 LAYER_RE = re.compile(r"model\.layers\.(\d+)\.")
 SHARED_RE = re.compile(r"\.mlp\.shared_mlp\.")
+
+# MiniMax-M3 EOS token id (from generation_config.json). Used as a fallback when
+# the flattened config.json reports eos_token_id: null.
+M3_EOS_TOKEN_ID = 200020
 
 
 def layer_idx(name: str) -> int:
     m = LAYER_RE.search(name)
     return int(m.group(1)) if m else -1
+
+
+def _normalize(name: str) -> str:
+    """Normalize a (possibly raw HF) tensor name to the engine's canonical form.
+
+    Three rewrites (the audit's converter bugs 1 + 2 + shared_mlp):
+      1. Strip the ``language_model.`` prefix.
+      2. Rewrite HF's ``block_sparse_moe`` module component → ``mlp``.
+      3. Rewrite ``shared_mlp`` → ``shared_experts`` (older HF naming variant).
+    A side-effect of (2): ``block_sparse_moe.e_score_correction_bias`` becomes
+    ``mlp.e_score_correction_bias``, but the engine requests it under
+    ``mlp.gate.e_score_correction_bias`` — so insert ``.gate`` there too.
+
+    This function is idempotent: passing an already-canonical name returns it
+    unchanged. Both ``rename()`` and ``classify()`` call it so ``classify()``
+    is prefix-agnostic and works on raw HF names directly (per VAL-FOUND-004).
+    """
+    # (1) Strip language_model. prefix (idempotent: no-op if absent).
+    name = name.removeprefix("language_model.")
+    # (2) Rewrite block_sparse_moe -> mlp (idempotent: no-op if absent).
+    name = name.replace("block_sparse_moe", "mlp")
+    # e_score_correction_bias / expert_bias live directly under block_sparse_moe
+    # in HF's checkpoint, but the engine requests them under ``mlp.gate.*``.
+    # After (2) they became ``mlp.e_score_correction_bias`` / ``mlp.expert_bias``;
+    # insert the missing ``.gate`` component.
+    name = name.replace(".mlp.e_score_correction_bias", ".mlp.gate.e_score_correction_bias")
+    name = name.replace(".mlp.expert_bias", ".mlp.gate.expert_bias")
+    # (3) Rewrite shared_mlp -> shared_experts (idempotent: no-op if absent).
+    name = SHARED_RE.sub(".mlp.shared_experts.", name)
+    # (4) Rewrite HF per-expert weight naming w1/w2/w3 -> gate_proj/down_proj/up_proj.
+    # HF MiniMax-M3 stores routed experts as experts.E.{w1,w2,w3}.weight where
+    # w1=gate (hidden→inter), w3=up (hidden→inter), w2=down (inter→hidden).
+    # The engine requests experts.E.{gate_proj,up_proj,down_proj}.weight, so:
+    #   w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj.
+    name = re.sub(r"\.experts\.(\d+)\.w1\.weight", r".experts.\1.gate_proj.weight", name)
+    name = re.sub(r"\.experts\.(\d+)\.w3\.weight", r".experts.\1.up_proj.weight", name)
+    name = re.sub(r"\.experts\.(\d+)\.w2\.weight", r".experts.\1.down_proj.weight", name)
+    return name
 
 
 def quant_int8(w: np.ndarray):
@@ -75,11 +121,16 @@ def flatten_config(raw: dict) -> dict:
     else:
         first = 0
     rope = tc.get("rope_parameters") or {}
+    # eos_token_id: HF ships null in config.json for this checkpoint; fall back
+    # to the M3 generation_config.json value (200020). Fixes the audit's
+    # "eos_token_id null -> 0 at runtime" bug (VAL-FOUND-005 / VAL-CORR-017).
     eos = raw.get("eos_token_id", tc.get("eos_token_id"))
     if isinstance(eos, list):
-        eos = eos[0] if eos else 200020
+        eos = eos[0] if eos else M3_EOS_TOKEN_ID
+    if eos is None:
+        eos = M3_EOS_TOKEN_ID
     theta = tc.get("rope_theta", rope.get("rope_theta", 5000000.0))
-    return {
+    cfg = {
         "model_type": "minimax_m3",
         "hidden_size": tc["hidden_size"],
         "num_hidden_layers": tc["num_hidden_layers"],
@@ -107,6 +158,11 @@ def flatten_config(raw: dict) -> dict:
         "eos_token_id": eos,
         "max_position_embeddings": tc.get("max_position_embeddings", 1048576),
     }
+    # Preserve sparse_attention_config if present (needed by the MSA port).
+    sac = tc.get("sparse_attention_config") or raw.get("sparse_attention_config")
+    if sac:
+        cfg["sparse_attention_config"] = sac
+    return cfg
 
 
 def should_skip(name: str, n_layers: int) -> bool:
@@ -119,27 +175,62 @@ def should_skip(name: str, n_layers: int) -> bool:
 
 
 def classify(name: str) -> str:
-    if name.endswith("_scale") or name.endswith("_scale_inv"):
+    """Classify a tensor name into a quantization class.
+
+    Prefix-agnostic: operates on the canonical (normalized) name, so it returns
+    the same answer whether given a raw HF name (``language_model.model...``) or
+    a stripped engine name (``model...``). Per VAL-FOUND-004 the policy is:
+
+      embed_tokens / lm_head          -> io     (int8,  io_bits=8)
+      *.mlp.gate.weight (router)      -> f32
+      *.mlp.gate.e_score_correction_bias -> f32
+      *.mlp.experts.*  (routed)       -> expert (int4, ebits=4)
+      *.mlp.shared_experts.*          -> expert (int4, ebits=4)
+      all *norm* (layernorm/final/qk/index norms) -> f32
+      *.self_attn.{q,k,v,o}_proj      -> attn   (int4, dbits=4)
+      *.self_attn.index_{q,k}_proj    -> attn   (int4, dbits=4)
+      dense mlp.{gate,up,down}_proj   -> dense  (int4, dbits=4)
+    """
+    n = _normalize(name)
+    if n.endswith("_scale") or n.endswith("_scale_inv") or n.endswith(".qs"):
         return "skip"
-    if name.endswith("e_score_correction_bias") or name.endswith("expert_bias"):
+    # Router bias / expert bias -> f32 (checked before router gate so the
+    # ``.gate.e_score_correction_bias`` suffix lands here, not in the gate branch).
+    if "e_score_correction_bias" in n or n.endswith("expert_bias"):
         return "f32"
-    if name.endswith("mlp.gate.weight") or name.endswith("mlp.router.gate.weight"):
+    # MoE router gate weight -> f32.
+    if ".mlp.gate.weight" in n:
         return "f32"
-    if name.endswith("norm.weight") or name == "model.norm.weight":
+    # All norms (input_layernorm, post_attention_layernorm, model.norm,
+    # per-head q_norm/k_norm, index_q_norm/index_k_norm) -> f32.
+    if "norm.weight" in n or n == "model.norm.weight":
         return "f32"
-    if name.endswith("q_norm.weight") or name.endswith("k_norm.weight"):
-        return "f32"
-    if name in ("model.embed_tokens.weight", "lm_head.weight"):
+    # Embeddings and lm_head -> int8 (io).
+    if n == "model.embed_tokens.weight" or n == "lm_head.weight":
         return "io"
-    if ".mlp.experts." in name and name.endswith(".weight"):
+    # Routed experts -> int4 (expert).
+    if ".mlp.experts." in n and n.endswith(".weight"):
         return "expert"
-    if name.endswith(".weight"):
+    # Shared experts -> int4 (expert).
+    if ".mlp.shared_experts." in n and n.endswith(".weight"):
+        return "expert"
+    # Attention projections (q/k/v/o + index_q_proj/index_k_proj) -> int4 (attn).
+    if ".self_attn." in n and n.endswith("_proj.weight"):
+        return "attn"
+    # Fallback: any other weight tensor -> dense (int4 when dbits=4).
+    if n.endswith(".weight"):
         return "dense"
     return "f32"
 
 
 def rename(name: str) -> str:
-    return SHARED_RE.sub(".mlp.shared_experts.", name)
+    """Rewrite a raw HF tensor name to the engine's canonical form.
+
+    See ``_normalize`` for the full set of rewrites. This is a thin wrapper
+    kept as a public entry point so callers (and tests) can exercise the
+    renaming in isolation from classify().
+    """
+    return _normalize(name)
 
 
 def expand(name: str, w: np.ndarray):
@@ -214,15 +305,19 @@ def write_sidecar(indir: str, outdir: str, raw_cfg: dict | None = None):
             shutil.copy2(src, outdir)
 
 
-def convert_local(indir: str, outdir: str, n_layers: int, ebits: int, io_bits: int, dbits: int):
+def convert_local(indir: str, outdir: str, n_layers: int, ebits: int, io_bits: int, dbits: int,
+                  max_shards: int | None = None):
     from safetensors.numpy import save_file
 
     os.makedirs(outdir, exist_ok=True)
     shards = sorted(glob.glob(os.path.join(indir, "*.safetensors")))
     if not shards:
         sys.exit(f"no safetensors in {indir}")
+    total = len(shards)
+    if max_shards is not None:
+        shards = shards[:max_shards]
     for i, sp in enumerate(shards):
-        out_path = os.path.join(outdir, f"out-{i:05d}.safetensors")
+        out_path = os.path.join(outdir, f"out-{i:05d}-of-{total:05d}.safetensors")
         if os.path.isfile(out_path):
             print(f"[{i+1}/{len(shards)}] skip existing {os.path.basename(out_path)}")
             continue
@@ -234,13 +329,17 @@ def convert_local(indir: str, outdir: str, n_layers: int, ebits: int, io_bits: i
     print(f"done: {len(shards)} shards -> {outdir}")
 
 
-def convert_repo(repo: str, outdir: str, n_layers: int, ebits: int, io_bits: int, dbits: int):
+def convert_repo(repo: str, outdir: str, n_layers: int, ebits: int, io_bits: int, dbits: int,
+                 max_shards: int | None = None):
     from huggingface_hub import hf_hub_download, list_repo_files
     from safetensors.numpy import save_file
 
     os.makedirs(outdir, exist_ok=True)
     files = [f for f in list_repo_files(repo) if f.endswith(".safetensors") and f.startswith("model-")]
     files.sort()
+    total = len(files)
+    if max_shards is not None:
+        files = files[:max_shards]
     meta = tempfile.mkdtemp(prefix="m3meta_", dir=outdir)
     for fn in ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                "generation_config.json"):
@@ -255,7 +354,7 @@ def convert_repo(repo: str, outdir: str, n_layers: int, ebits: int, io_bits: int
         write_sidecar(meta, outdir, raw)
 
     for i, fn in enumerate(files):
-        out_path = os.path.join(outdir, f"out-{i:05d}.safetensors")
+        out_path = os.path.join(outdir, f"out-{i:05d}-of-{total:05d}.safetensors")
         if os.path.isfile(out_path):
             print(f"[{i+1}/{len(files)}] skip {os.path.basename(out_path)}")
             continue
@@ -284,12 +383,14 @@ def main():
     ap.add_argument("--io-bits", type=int, default=8)
     ap.add_argument("--dbits", type=int, default=None)
     ap.add_argument("--n-layers", type=int, default=60)
+    ap.add_argument("--max-shards", type=int, default=None,
+                   help="convert only N shards (smoke mode, e.g. --max-shards 1)")
     a = ap.parse_args()
     dbits = a.dbits if a.dbits is not None else a.ebits
     if a.indir:
-        convert_local(a.indir, a.outdir, a.n_layers, a.ebits, a.io_bits, dbits)
+        convert_local(a.indir, a.outdir, a.n_layers, a.ebits, a.io_bits, dbits, a.max_shards)
     elif a.repo:
-        convert_repo(a.repo, a.outdir, a.n_layers, a.ebits, a.io_bits, dbits)
+        convert_repo(a.repo, a.outdir, a.n_layers, a.ebits, a.io_bits, dbits, a.max_shards)
     else:
         sys.exit("pass --repo or --indir")
 

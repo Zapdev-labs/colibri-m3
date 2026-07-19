@@ -100,7 +100,13 @@ def cmd_convert(a: argparse.Namespace) -> None:
     out = a.model or a.outdir
     if not out:
         sys.exit("--model/--outdir required")
-    cmd = [sys.executable, CONVERT, "--outdir", out, "--ebits", str(a.ebits), "--io-bits", str(a.dbits)]
+    # io_bits is always 8: embed_tokens.weight and lm_head.weight must be int8
+    # per VAL-FOUND-004 (never int4). dbits defaults to ebits inside convert.py.
+    cmd = [sys.executable, CONVERT, "--outdir", out,
+           "--ebits", str(a.ebits), "--io-bits", "8",
+           "--dbits", str(a.ebits)]
+    if getattr(a, "single_shard", False):
+        cmd += ["--max-shards", "1"]
     if a.repo:
         cmd += ["--repo", a.repo]
     elif a.indir:
@@ -231,6 +237,8 @@ def main() -> None:
     p.add_argument("--repo", default="MiniMaxAI/MiniMax-M3")
     p.add_argument("--indir")
     p.add_argument("--outdir")
+    p.add_argument("--single-shard", action="store_true",
+                   help="convert only the first shard (smoke mode, <5 min fast-fail)")
     p.set_defaults(func=cmd_convert)
 
     p = sub.add_parser("run")
