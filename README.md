@@ -31,16 +31,16 @@ make -j
 
 ```bash
 # shard-by-shard from Hugging Face (never needs full BF16 on disk)
-./coli convert --repo MiniMaxAI/MiniMax-M3 --model /data/m3_i4
+./coli convert --repo MiniMaxAI/MiniMax-M3 --model /home/ai/models/m3_i4_v2
 
 # or local checkout
-./coli convert --indir ./MiniMax-M3 --model ./m3_i4
+./coli convert --indir ./MiniMax-M3 --model /home/ai/models/m3_i4_v2
 ```
 
 ## Run (ai-server style: 96 threads, planar KV)
 
 ```bash
-export COLI_MODEL=/data/m3_i4
+export COLI_MODEL=/home/ai/models/m3_i4_v2
 export OMP_NUM_THREADS=96 OMP_PLACES=cores OMP_PROC_BIND=close
 ./coli chat --planar --cap 256 --ctx 8192
 ./coli serve --planar --host 0.0.0.0 --port 8080

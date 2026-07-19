@@ -70,34 +70,59 @@ def _normalize(name: str) -> str:
 
 
 def quant_int8(w: np.ndarray):
+    """Per-row symmetric int8 quantization. Vectorized with numpy broadcasting.
+
+    Bit-exact with the original per-row Python loop: for each row r, computes
+    ``amax = max(abs(w[r]))`` (as a Python float, which numpy computes in the
+    array's native dtype then upcasts to float64 for ``float(...)``), ``scale =
+    amax/127`` (or 1e-8 floor), then ``q[r] = clip(rint(w[r]/scale), -128, 127)``
+    as int8. Critically, ``w[r] / scale`` is performed in float32 when ``w`` is
+    float32 (numpy's scalar/array promotion): the per-row ``scale`` python float
+    preserves float32 precision in the division. We reproduce that by keeping
+    the division in float32: cast ``scale`` back to float32 and divide.
+    """
     o, i = w.shape
-    q = np.empty((o, i), dtype=np.int8)
-    s = np.empty(o, dtype=np.float32)
-    for r in range(o):
-        amax = float(np.max(np.abs(w[r])))
-        scale = amax / 127.0 if amax > 1e-8 else 1e-8
-        s[r] = scale
-        q[r] = np.clip(np.rint(w[r] / scale), -128, 127).astype(np.int8)
+    # Match the original loop: amax computed in float32 (numpy's max on the
+    # float32 row), then float() upcasts to python float64.
+    amax = np.max(np.abs(w), axis=1).astype(np.float64)
+    scale64 = np.where(amax > 1e-8, amax / 127.0, 1e-8)
+    s = scale64.astype(np.float32)
+    # The original loop computes w[r] / scale where w[r] is float32 and scale is
+    # python float (float64). Numpy promotes the result to float32 because the
+    # array operand w[r] is float32 and python-float / np.float32 stays float32
+    # when the array is the dividend. Reproduce by dividing in float32.
+    scale32 = scale64.astype(np.float32)
+    q = np.clip(np.rint(w.astype(np.float32) / scale32[:, None]), -128, 127).astype(np.int8)
     return q, s
 
 
 def quant_int4(w: np.ndarray):
+    """Per-row symmetric int4 quantization with two-nibbles-per-byte packing.
+
+    Vectorized with numpy broadcasting; bit-exact with the original per-row loop.
+    Each row r: ``amax = max(abs(w[r]))`` (float64 via python float), ``scale =
+    amax/7`` (floor 1e-8), ``q = clip(rint(w[r]/scale), -8, 7)``. Then each int
+    is shifted to unsigned (``q+8`` -> 0..15) and packed two-per-byte (low
+    nibble first). If the row width is odd, the trailing high nibble is 8
+    (neutral). The division ``w[r]/scale`` runs in float32 to match the loop's
+    numpy scalar/array promotion exactly.
+    """
     o, i = w.shape
     rb = (i + 1) // 2
-    q4 = np.zeros((o, rb), dtype=np.uint8)
-    s = np.empty(o, dtype=np.float32)
-    for r in range(o):
-        amax = float(np.max(np.abs(w[r])))
-        scale = amax / 7.0 if amax > 1e-8 else 1e-8
-        s[r] = scale
-        q = np.clip(np.rint(w[r] / scale), -8, 7).astype(np.int32)
-        packed = np.zeros(rb, dtype=np.uint8)
-        for c in range(0, i, 2):
-            lo = int(q[c]) + 8
-            hi = (int(q[c + 1]) + 8) if c + 1 < i else 8
-            packed[c >> 1] = (lo & 0xF) | ((hi & 0xF) << 4)
-        q4[r] = packed
-    return q4, s
+    amax = np.max(np.abs(w), axis=1).astype(np.float64)
+    scale64 = np.where(amax > 1e-8, amax / 7.0, 1e-8)
+    s = scale64.astype(np.float32)
+    # Divide in float32 to match the original loop's promotion behavior.
+    scale32 = scale64.astype(np.float32)
+    q = np.clip(np.rint(w.astype(np.float32) / scale32[:, None]), -8, 7).astype(np.int32) + 8
+    if i % 2 == 1:
+        pad = np.full((o, 1), 8, dtype=np.int32)
+        q = np.concatenate([q, pad], axis=1)
+    q2 = q.reshape(o, rb, 2)
+    lo = (q2[:, :, 0] & 0xF).astype(np.uint8)
+    hi = (q2[:, :, 1] & 0xF).astype(np.uint8)
+    packed = lo | (hi << 4)
+    return packed, s
 
 
 def flatten_config(raw: dict) -> dict:
