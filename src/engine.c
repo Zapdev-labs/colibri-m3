@@ -879,11 +879,163 @@ static int run_gen(Model *m, const int *prompt, int np, int max_new) {
     return 0;
 }
 
+/* ---------- dry-run: tensor-presence check ---------- *
+ * Validates that every tensor the engine's load_model expects (derived from
+ * config.json) is present in the converted snapshot, with the expected dtype
+ * (quantized tensors must have a `.qs` scale companion; f32 tensors must NOT).
+ * Produces a structured report: expected / found / missing / mis-typed counts.
+ * Exits 0 only if 100% of expected tensors are present and correctly typed.
+ *
+ * Tensor dtype policy (must match tools/convert.py classify()):
+ *   quant (need name + name.qs): embed_tokens, lm_head, self_attn.{q,k,v,o}_proj,
+ *                                 shared_experts.{gate,up,down}_proj, dense mlp.{gate,up,down}_proj,
+ *                                 mlp.experts.E.{gate,up,down}_proj
+ *   f32   (need name, NO .qs):   model.norm, input_layernorm, post_attention_layernorm,
+ *                                 self_attn.{q,k}_norm, mlp.gate.weight (router),
+ *                                 mlp.gate.e_score_correction_bias
+ */
+static int dr_check_quant(shards *S, const char *name, long *exp, long *fnd, long *mis, long *mt) {
+    char qs[640];
+    snprintf(qs, sizeof(qs), "%s.qs", name);
+    (*exp)++;
+    if (!st_has(S, name)) {
+        fprintf(stderr, "[dry-run] MISSING: %s\n", name);
+        (*mis)++;
+        return 1;
+    }
+    (*fnd)++;
+    if (!st_has(S, qs)) {
+        fprintf(stderr, "[dry-run] MIS-TYPED: %s (expected quantized w/ .qs scale, found f32)\n", name);
+        (*mt)++;
+        return 1;
+    }
+    return 0;
+}
+static int dr_check_f32(shards *S, const char *name, long *exp, long *fnd, long *mis, long *mt) {
+    char qs[640];
+    snprintf(qs, sizeof(qs), "%s.qs", name);
+    (*exp)++;
+    if (!st_has(S, name)) {
+        fprintf(stderr, "[dry-run] MISSING: %s\n", name);
+        (*mis)++;
+        return 1;
+    }
+    (*fnd)++;
+    if (st_has(S, qs)) {
+        fprintf(stderr, "[dry-run] MIS-TYPED: %s (expected f32, found quantized w/ .qs)\n", name);
+        (*mt)++;
+        return 1;
+    }
+    return 0;
+}
+/* optional quant tensor: only flagged if present but mis-typed; absence is OK */
+static void dr_check_opt_quant(shards *S, const char *name, long *exp, long *fnd, long *mt) {
+    char qs[640];
+    snprintf(qs, sizeof(qs), "%s.qs", name);
+    if (!st_has(S, name)) return; /* optional */
+    (*exp)++;
+    (*fnd)++;
+    if (!st_has(S, qs)) {
+        fprintf(stderr, "[dry-run] MIS-TYPED: %s (expected quantized w/ .qs scale, found f32)\n", name);
+        (*mt)++;
+    }
+}
+/* f32 tensor with a named fallback (e.g. e_score_correction_bias -> expert_bias) */
+static int dr_check_f32_alt(shards *S, const char *name, const char *alt,
+                            long *exp, long *fnd, long *mis, long *mt) {
+    if (st_has(S, name)) return dr_check_f32(S, name, exp, fnd, mis, mt);
+    if (alt && st_has(S, alt)) return dr_check_f32(S, alt, exp, fnd, mis, mt);
+    (*exp)++;
+    fprintf(stderr, "[dry-run] MISSING: %s (or fallback %s)\n", name, alt ? alt : "(none)");
+    (*mis)++;
+    return 1;
+}
+
+static int dry_run(const char *snap) {
+    Cfg c;
+    load_cfg(&c, snap);
+    shards S;
+    st_init(&S, snap);
+
+    long expected = 0, found = 0, missing = 0, mistyped = 0;
+    char nm[512];
+
+    dr_check_quant(&S, "model.embed_tokens.weight", &expected, &found, &missing, &mistyped);
+    dr_check_opt_quant(&S, "lm_head.weight", &expected, &found, &mistyped);
+    dr_check_f32(&S, "model.norm.weight", &expected, &found, &missing, &mistyped);
+
+    for (int i = 0; i < c.layers; i++) {
+        snprintf(nm, sizeof(nm), "model.layers.%d.input_layernorm.weight", i);
+        dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", i);
+        dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_proj.weight", i);
+        dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.k_proj.weight", i);
+        dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.v_proj.weight", i);
+        dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.o_proj.weight", i);
+        dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_norm.weight", i);
+        dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.k_norm.weight", i);
+        dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+        if (i >= c.first_dense) {
+            /* MoE layer: router, bias, shared expert, routed experts */
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", i);
+            dr_check_f32(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.e_score_correction_bias", i);
+            char alt[512];
+            snprintf(alt, sizeof(alt), "model.layers.%d.mlp.gate.expert_bias", i);
+            dr_check_f32_alt(&S, nm, alt, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.shared_experts.gate_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.shared_experts.up_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.shared_experts.down_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            for (int e = 0; e < c.experts; e++) {
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.gate_proj.weight", i, e);
+                dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.up_proj.weight", i, e);
+                dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.down_proj.weight", i, e);
+                dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            }
+        } else {
+            /* dense MLP layer (first 3) */
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.up_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.down_proj.weight", i);
+            dr_check_quant(&S, nm, &expected, &found, &missing, &mistyped);
+        }
+    }
+
+    fprintf(stderr,
+            "[dry-run] indexed %d tensors in %d shards, expected %ld, found %ld, "
+            "missing %ld, mis-typed %ld\n",
+            S.n, S.nfd, expected, found, missing, mistyped);
+    if (missing == 0 && mistyped == 0) {
+        fprintf(stderr, "[dry-run] all tensors present\n");
+        return 0;
+    }
+    fprintf(stderr, "[dry-run] FAILED: %ld missing, %ld mis-typed\n", missing, mistyped);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) {
         fprintf(stderr, "usage: SNAP=<model_dir> ./m3 [cache] [ebits] [dbits] [ctx]\n");
+        fprintf(stderr, "       SNAP=<model_dir> ./m3 --dry-run\n");
         return 1;
+    }
+    /* --dry-run: tensor-presence check before allocating memory */
+    if (argc > 1 && !strcmp(argv[1], "--dry-run")) {
+        return dry_run(snap);
     }
     int cap = argc > 1 ? atoi(argv[1]) : 128;
     int ebits = argc > 2 ? atoi(argv[2]) : 4;

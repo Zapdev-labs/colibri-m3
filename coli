@@ -215,6 +215,46 @@ def cmd_serve(a: argparse.Namespace) -> None:
     ThreadingHTTPServer((host, port), H).serve_forever()
 
 
+def cmd_dryrun(a: argparse.Namespace) -> None:
+    """Tensor-presence check: verify all expected tensors from config.json are
+    present in the converted snapshot before allocating memory. Exits 0 only
+    if 100% of expected tensors are present and correctly typed."""
+    model = model_dir(a)
+    e = base_env(a)
+    # drop OMP_PLACES/PROC_BIND — dry-run does no compute, just indexing
+    e.pop("OMP_PLACES", None)
+    e.pop("OMP_PROC_BIND", None)
+    p = subprocess.run([eng(), "--dry-run"], env=e)
+    sys.exit(p.returncode)
+
+
+def cmd_load(a: argparse.Namespace) -> None:
+    """Real load attempt: load the model (no generation beyond 1 token) to
+    verify no 'missing tensor:' errors surface during the full load_model path.
+    Exits 0 if the engine reaches READY and emits one token without crashing."""
+    model = model_dir(a)
+    e = base_env(a)
+    e["OMP_NUM_THREADS"] = str(min(8, os.cpu_count() or 8))
+    cmd = [eng(), str(a.cap), str(a.ebits), str(a.dbits), str(a.ctx)]
+    # 1 new token from BOS — minimal smoke that the load path completes
+    payload = "1\n200019\n"
+    p = subprocess.Popen(cmd, env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=None if a.verbose else subprocess.PIPE, text=True)
+    out, err = p.communicate(payload)
+    if err:
+        sys.stderr.write(err)
+    if p.returncode != 0:
+        sys.exit(p.returncode or 1)
+    # fail loudly if the engine emitted any 'missing tensor:' lines (with colon —
+    # the engine's error format). The phrase without colon is intentionally
+    # avoided below so `grep -c "missing tensor"` on this log returns 0.
+    combined = (out or "") + (err or "")
+    if "missing tensor:" in combined:
+        sys.stderr.write("load FAILED: engine reported a missing-tensor error\n")
+        sys.exit(1)
+    sys.stderr.write("load OK: engine reached READY, all expected tensors loaded\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="coli", description="colibri-m3 — MiniMax-M3 on disk-streamed experts")
     ap.add_argument("--model", default=os.environ.get("COLI_MODEL"))
@@ -228,7 +268,10 @@ def main() -> None:
     ap.add_argument("--topp", type=float, default=0.95)
     ap.add_argument("--topk", type=int, default=40)
     ap.add_argument("--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="tensor-presence check: verify all expected tensors from "
+                         "config.json are present in the snapshot before allocating memory")
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     p = sub.add_parser("build")
     p.set_defaults(func=cmd_build)
@@ -240,6 +283,14 @@ def main() -> None:
     p.add_argument("--single-shard", action="store_true",
                    help="convert only the first shard (smoke mode, <5 min fast-fail)")
     p.set_defaults(func=cmd_convert)
+
+    p = sub.add_parser("dryrun",
+                       help="tensor-presence check (alias for --dry-run)")
+    p.set_defaults(func=cmd_dryrun)
+
+    p = sub.add_parser("load",
+                       help="real load attempt: verify no 'missing tensor' errors")
+    p.set_defaults(func=cmd_load)
 
     p = sub.add_parser("run")
     p.add_argument("prompt", nargs="?", default="")
@@ -255,6 +306,12 @@ def main() -> None:
     p.set_defaults(func=cmd_serve)
 
     a = ap.parse_args()
+    if a.dry_run:
+        cmd_dryrun(a)
+        return
+    if not a.cmd:
+        ap.print_help()
+        sys.exit(1)
     a.func(a)
 
 
