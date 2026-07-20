@@ -21,8 +21,11 @@
 #include <immintrin.h>
 #endif
 #include "json.h"
+#include "numa.h"
+#include "observability.h"
 #include "planar_kv.h"
 #include "st.h"
+#include "vnni.h"
 
 /* ---------- config ---------- */
 typedef struct {
@@ -95,6 +98,8 @@ static int g_topk_samp = 40, g_planar_bits = 3;
  * behavior (greedy when TEMP<=0, no TF dump, no nan instrumentation, time-seeded). */
 static int g_seed = 0;            /* 0 = time-seeded (legacy); >0 = fixed seed */
 static int g_tf_mode = 0;         /* 1 = teacher-force mode: dump top-K logprobs per position */
+static int g_moe_parallel = 0;   /* f12: 1 = dispatch routed experts concurrently across OMP threads */
+static NumaTopo g_numa;          /* f10: discovered NUMA topology (zeroed until numa_discover) */
 static int g_tf_topk = 200;       /* top-K logprobs to dump per TF position (matches oracle) */
 static const char *g_tf_out_path = NULL;  /* TF dump file (default: stdout) */
 static int g_nan_check = 0;       /* 1 = M3_CHECK_NAN mode: assert no NaN/Inf in intermediates */
@@ -403,8 +408,13 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4,
 
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
     if (w->fmt == 0) matmul_f(y, x, w->qf, S, w->I, w->O);
-    else if (w->fmt == 1) matmul_i8(y, x, w->q8, w->s, S, w->I, w->O);
-    else matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
+    else if (w->fmt == 1) {
+        if (g_use_vnni) matmul_i8_vnni(y, x, w->q8, w->s, S, w->I, w->O);
+        else            matmul_i8(y, x, w->q8, w->s, S, w->I, w->O);
+    } else {
+        if (g_use_vnni) matmul_i4_vnni(y, x, w->q4, w->s, S, w->I, w->O);
+        else            matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
+    }
 }
 
 static void qt_load(Model *m, const char *name, int O, int I, int bits, QT *t) {
@@ -569,6 +579,14 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
     m->kv_i8 = getenv("KV_I8") ? atoi(getenv("KV_I8")) : 0;
     m->planar = getenv("PLANAR_KV") ? atoi(getenv("PLANAR_KV")) : 0;
     if (m->planar) m->kv_i8 = 1;
+    /* f14: auto-enable INT8 KV when context >= 16K so the cache fits in the
+     * 350 GB RAM budget alongside the 199 GB int4 weights. At 32K context
+     * INT8 KV is ~2 GB; at 64K it is ~4 GB; the BF16 path at 32K is ~4 GB
+     * and at 1M would be ~125 GB (out of scope). User-set KV_I8 wins. */
+    if (!getenv("KV_I8") && !m->planar && max_t >= 16384) {
+        m->kv_i8 = 1;
+        fprintf(stderr, "[f14] auto-enabling INT8 KV cache (ctx=%d >= 16K)\n", max_t);
+    }
     Cfg *c = &m->c;
     int D = c->hidden;
     qt_load(m, "model.embed_tokens.weight", c->vocab, D, dbits, &m->embed);
@@ -681,6 +699,30 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
     fprintf(stderr, "[load] ready in %.1fs | expert cache %d/layer | kv_%s | msa_layers=%d\n",
             now_s() - t0, ecap,
             m->planar ? "planar" : (m->kv_i8 ? "i8" : "f32"), m->msa_layers);
+    /* f10: interleave the model struct's pages across all NUMA nodes so the
+     * dense-resident tensors are spread evenly between both sockets. The KV
+     * cache and per-layer tensors are also covered. Best-effort: mbind failure
+     * is logged but does not abort (the engine still runs correctly, just
+     * with whatever locality the allocator gave us). */
+    if (g_numa.interleave && g_numa.n_nodes > 1) {
+        int rc = numa_interleave_memory(m, sizeof(*m), g_numa.n_nodes);
+        if (rc != 0) fprintf(stderr, "[f10] WARN: mbind interleave rc=%d\n", rc);
+    }
+    /* f15: emit load_complete telemetry. */
+    long rss_kb = 0;
+#if defined(__linux__)
+    {
+        FILE *f = fopen("/proc/self/status", "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (sscanf(line, "VmRSS: %ld kB", &rss_kb) == 1) break;
+            }
+            fclose(f);
+        }
+    }
+#endif
+    telem_load_complete(c->layers, c->experts, rss_kb, m->msa_layers, m->kv_i8, m->planar);
 }
 
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
@@ -1142,6 +1184,94 @@ static void moe_router(int *idx, float *w, const float *x, const float *router,
     for (int kk = 0; kk < K; kk++) w[kk] *= router_scale;
 }
 
+/* f12: parallel MoE expert dispatch. Each routed expert runs concurrently
+ * across an OMP thread group; per-thread accumulators reduce into out at the end.
+ * Used when MOE_PARALLEL=1 (default for decode where S=1 and the 4 routed
+ * experts are independent). Falls back to the sequential moe() when off.
+ *
+ * Per-thread accumulator budget: T * S * D floats. For decode (S=1, D=6144, T=88)
+ * this is ~2 MB; for prefill (S=128) ~280 MB — acceptable on the 370 GB host.
+ * The shared expert is computed once after the parallel reduction (it is
+ * deterministic and single-threaded).
+ */
+static void moe_parallel(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->experts, K = c->topk, I = c->moe_inter, sI = I * c->n_shared;
+    float *logit = falloc(E), *choice = falloc(E);
+    int *idxs = (int *)malloc((size_t)S * K * sizeof(int));
+    float *ws = (float *)malloc((size_t)S * K * sizeof(float));
+    memset(out, 0, (size_t)S * D * sizeof(float));
+    for (int s = 0; s < S; s++) {
+        moe_router(idxs + (int64_t)s * K, ws + (int64_t)s * K,
+                   x + (int64_t)s * D, l->router, l->router_bias,
+                   D, E, K, c->route_norm, c->router_scale, logit, choice);
+    }
+    /* batch-union experts */
+    unsigned char *seen = (unsigned char *)calloc((size_t)E, 1);
+    int *uniq = (int *)malloc((size_t)E * sizeof(int));
+    int nu = 0;
+    for (int s = 0; s < S; s++)
+        for (int kk = 0; kk < K; kk++) {
+            int e = idxs[(int64_t)s * K + kk];
+            if (!seen[e]) { seen[e] = 1; uniq[nu++] = e; }
+        }
+
+    int T = omp_get_max_threads();
+    if (T < 1) T = 1;
+    /* Per-thread accumulators. Allocated as one contiguous block for locality. */
+    float *acc = (float *)calloc((size_t)T * S * D, sizeof(float));
+    float *xg_priv = (float *)malloc((size_t)S * D);
+    float *gg = falloc((size_t)S * I), *uu = falloc((size_t)S * I),
+          *hh = falloc((size_t)S * D);
+    int *rows = (int *)malloc((size_t)S * sizeof(int));
+    float *rw = (float *)malloc((size_t)S * sizeof(float));
+
+    #pragma omp parallel for schedule(dynamic, 1) firstprivate(gg, uu, hh, rows, rw, xg_priv)
+    for (int j = 0; j < nu; j++) {
+        int tid = omp_get_thread_num();
+        float *my_acc = acc + (int64_t)tid * S * D;
+        int eid = uniq[j];
+        ESlot *e = expert_get(m, layer, eid);
+        int nr = 0;
+        for (int s = 0; s < S; s++)
+            for (int kk = 0; kk < K; kk++)
+                if (idxs[(int64_t)s * K + kk] == eid) {
+                    rows[nr] = s; rw[nr] = ws[(int64_t)s * K + kk]; nr++;
+                    break;
+                }
+        for (int r = 0; r < nr; r++)
+            memcpy(xg_priv + (int64_t)r * D, x + (int64_t)rows[r] * D, (size_t)D * sizeof(float));
+        matmul_qt(gg, xg_priv, &e->g, nr);
+        matmul_qt(uu, xg_priv, &e->u, nr);
+        for (int64_t z = 0; z < (int64_t)nr * I; z++)
+            gg[z] = swiglu(gg[z], uu[z], c->sw_alpha, c->sw_limit);
+        matmul_qt(hh, gg, &e->d, nr);
+        for (int r = 0; r < nr; r++) {
+            float w = rw[r]; float *hr = hh + (int64_t)r * D;
+            float *os = my_acc + (int64_t)rows[r] * D;
+            for (int d = 0; d < D; d++) os[d] += w * hr[d];
+        }
+    }
+    /* Reduce per-thread accumulators into out. */
+    for (int tid = 0; tid < T; tid++) {
+        const float *my = acc + (int64_t)tid * S * D;
+        for (int64_t z = 0; z < (int64_t)S * D; z++) out[z] += my[z];
+    }
+
+    /* Shared expert — same as sequential path, runs once after routed experts. */
+    float *sg = falloc((int64_t)S * sI), *su = falloc((int64_t)S * sI);
+    matmul_qt(sg, x, &l->sh_gate, S);
+    matmul_qt(su, x, &l->sh_up, S);
+    for (int64_t z = 0; z < (int64_t)S * sI; z++)
+        sg[z] = swiglu(sg[z], su[z], c->sw_alpha, c->sw_limit);
+    matmul_qt(hh, sg, &l->sh_down, S);
+    for (int64_t z = 0; z < (int64_t)S * D; z++) out[z] += hh[z];
+
+    free(acc); free(xg_priv); free(gg); free(uu); free(hh);
+    free(rows); free(rw); free(sg); free(su);
+    free(logit); free(choice); free(idxs); free(ws); free(seen); free(uniq);
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->experts, K = c->topk, I = c->moe_inter, sI = I * c->n_shared;
@@ -1225,8 +1355,10 @@ static void layer_fwd(Model *m, int li, float *x, int S, int pos0, float *nrm, f
     for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
     for (int s = 0; s < S; s++) rmsnorm(nrm + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps, c->gemma_norm);
     if (g_nan_check || g_debug_trace) nan_check_layer(li, "post_ln", nrm, (int64_t)S * D);
-    if (l->sparse) moe(m, l, li, nrm, S, tmp);
-    else dense_mlp(m, l, nrm, S, tmp);
+    if (l->sparse) {
+        if (g_moe_parallel) moe_parallel(m, l, li, nrm, S, tmp);
+        else                moe(m, l, li, nrm, S, tmp);
+    } else dense_mlp(m, l, nrm, S, tmp);
     if (g_nan_check || g_debug_trace) nan_check_layer(li, "mlp_out", tmp, (int64_t)S * D);
     for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
     if (g_nan_check || g_debug_trace) nan_check_layer(li, "residual", x, (int64_t)S * D);
@@ -1368,11 +1500,22 @@ static int run_gen(Model *m, const int *prompt, int np, int max_new) {
         rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
         matmul_qt(logits, nrm, &m->lm_head, 1);
         if (g_nan_check || g_debug_trace) nan_check_layer(-1, "lm_head_logits", logits, c->vocab);
+        /* f15: per-token decode telemetry. Rolling tok/s over the decode so far. */
+        if (g_telem.enabled) {
+            double step_dt = now_s() - t0;
+            double rolling = (t + 1) / (step_dt > 1e-6 ? step_dt : 1e-6);
+            telem_decode_step(t, step_dt * 1000.0 / (t + 1),
+                              (int)m->hits, (int)m->miss, rolling);
+        }
     }
     double dt = now_s() - t0;
     double tot = (double)(m->hits + m->miss);
+    double tokps = emitted / (dt > 1e-6 ? dt : 1e-6);
+    double hit_rate = tot ? (double)m->hits / tot : 0.0;
     fprintf(stderr, "[stat] %d tok in %.2fs (%.2f tok/s) | expert hit %.1f%%\n", emitted, dt,
-            emitted / (dt > 1e-6 ? dt : 1e-6), tot ? 100.0 * m->hits / tot : 0.0);
+            tokps, hit_rate * 100.0);
+    /* f15: emit run_complete telemetry event. */
+    telem_run_complete(emitted, dt, tokps, hit_rate, "colibri-m3");
     if (g_nan_check) {
         fprintf(stderr, "[nan-check] %ld failures detected over %d tokens\n",
                 g_nan_failures, emitted);
@@ -1657,6 +1800,30 @@ int main(int argc, char **argv) {
     if (getenv("TF_OUT")) g_tf_out_path = getenv("TF_OUT");
     if (getenv("M3_CHECK_NAN")) g_nan_check = atoi(getenv("M3_CHECK_NAN"));
     if (getenv("DEBUG_TRACE")) g_debug_trace = atoi(getenv("DEBUG_TRACE"));
+    /* f11: VNNI matmul kernels (USE_VNNI=1 enables AVX-512_VNNI path). */
+    if (getenv("USE_VNNI")) g_use_vnni = atoi(getenv("USE_VNNI"));
+    /* f12: parallel MoE expert dispatch (MOE_PARALLEL=1). */
+    if (getenv("MOE_PARALLEL")) g_moe_parallel = atoi(getenv("MOE_PARALLEL"));
+    /* f10: NUMA topology discovery + optional thread pinning. */
+    if (getenv("NUMA_INTERLEAVE")) {
+        g_numa.interleave = atoi(getenv("NUMA_INTERLEAVE"));
+    } else {
+        g_numa.interleave = 1;   /* default: interleave model pages */
+    }
+    if (getenv("NUMA_PIN_THREADS")) {
+        g_numa.pin_threads = atoi(getenv("NUMA_PIN_THREADS"));
+    } else {
+        g_numa.pin_threads = 1;   /* default: pin OMP threads to CPUs */
+    }
+    numa_discover(&g_numa);
+    fprintf(stderr, "[f10] NUMA: n_cpus=%d n_nodes=%d interleave=%d pin=%d\n",
+            g_numa.n_cpus, g_numa.n_nodes, g_numa.interleave, g_numa.pin_threads);
+    if (g_numa.interleave) {
+        int br = numa_disable_balancing();
+        if (br == 0) fprintf(stderr, "[f10] disabled kernel NUMA balancing\n");
+    }
+    /* f15: telemetry init (M3_TELEMETRY_PATH env var). */
+    telem_init();
 
     /* f8: seeded determinism. SEED=0 (or unset) => legacy time-seeded path;
      * SEED>0 => fixed seed for reproducible sampling (VAL-CORR-018, VAL-CROSS-006). */

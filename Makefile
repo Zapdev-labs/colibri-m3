@@ -13,7 +13,10 @@ C_TESTS = c/tests/test_msa \
           c/tests/test_moe_routing \
           c/tests/test_per_head_qk_norm \
           c/tests/test_kv_quant \
-          c/tests/test_expert_slab_load
+          c/tests/test_expert_slab_load \
+          c/tests/test_vnni \
+          c/tests/test_numa \
+          c/tests/test_int8_kv
 
 # Engine + headers shared by every C test.
 ENGINE_SRCS = src/engine.c src/st.h src/json.h src/planar_kv.h
@@ -81,9 +84,34 @@ test-nan:
 	@echo "==> running numerical stability test (VAL-CORR-024)"
 	@python3 tools/test_numerical_stability.py
 
+# f9: cross-oracle comparison vs llama.cpp fork (VAL-CORR-021).
+# Requires the 247GB GGUF model and llama-server; gated behind explicit invocation.
+test-cross-oracle:
+	@echo "==> running cross-oracle comparison vs llama.cpp fork (VAL-CORR-021)"
+	@python3 tools/cross_oracle_compare.py --mode both --ngen 20 --tf-tokens 32
+
+# f13: throughput benchmark targeting >=5 tok/s. Requires the 199GB int4 model.
+test-throughput:
+	@echo "==> running f13 throughput benchmark (target >=5 tok/s)"
+	@python3 tools/bench_throughput.py --ngen 200 --use-vnni --numa-interleave
+
+# f15: cross-engine observability harness (requires both engines + telemetry).
+test-observability:
+	@echo "==> running f15 cross-engine observability harness"
+	@python3 tools/observability.py --compare
+
+# f9/f13 lightweight smoke tests (no 247GB model load required).
+test-cross-oracle-smoke:
+	@echo "==> running f9 cross-oracle harness smoke test"
+	@python3 tools/test_cross_oracle.py
+
+test-throughput-smoke:
+	@echo "==> running f13 throughput benchmark smoke test"
+	@python3 tools/test_throughput.py
+
 test-oracle-all: test-oracle-greedy test-oracle-logits test-eos test-determinism test-kv-cache test-nan
 
-test: test-converter test-c test-tokenizer
+test: test-converter test-c test-tokenizer test-cross-oracle-smoke test-throughput-smoke
 	@echo "==> (oracle / e2e tests are gated behind 'make test-oracle-all' because they"
 	@echo "     each reload the 199GB model; run them explicitly when the host is free)"
 

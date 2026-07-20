@@ -262,7 +262,63 @@ def cmd_load(a: argparse.Namespace) -> None:
     sys.stderr.write("load OK: engine reached READY, all expected tensors loaded\n")
 
 
-def main() -> None:
+def cmd_numa(a: argparse.Namespace) -> None:
+    """f10: wrap the engine in numactl --interleave=all + thread pinning."""
+    script = os.path.join(ROOT, "scripts", "run-numa.sh")
+    if not os.path.isfile(script):
+        sys.exit(f"missing {script}")
+    cmd = [script] + (a.engine_args or [])
+    env = os.environ.copy()
+    # Pass through the standard COLI_MODEL / OMP_* env vars.
+    env["COLI_MODEL"] = model_dir(a)
+    log(f"launching NUMA wrapper: {' '.join(cmd)}")
+    sys.exit(subprocess.call(cmd, env=env))
+
+
+def cmd_bench(a: argparse.Namespace) -> None:
+    """f13: run the throughput benchmark."""
+    env = base_env(a)
+    env["USE_VNNI"] = str(a.vnni)
+    env["MOE_PARALLEL"] = str(a.moe_parallel)
+    env["NUMA_INTERLEAVE"] = "1"
+    env["NUMA_PIN_THREADS"] = "1"
+    if a.telemetry:
+        env["M3_TELEMETRY_PATH"] = a.telemetry
+    args = ["--model", model_dir(a), "--ngen", str(a.ngen),
+            "--prompt", a.prompt, "--threads", str(env["OMP_NUM_THREADS"])]
+    if a.vnni:
+        args.append("--use-vnni")
+    if a.telemetry:
+        args += ["--telemetry", a.telemetry]
+    bench = os.path.join(ROOT, "tools", "bench_throughput.py")
+    log(f"launching bench: {bench} {' '.join(args)}")
+    sys.exit(subprocess.call(["python3", bench] + args, env=env))
+
+
+def cmd_cross_oracle(a: argparse.Namespace) -> None:
+    """f9: cross-oracle comparison vs llama.cpp fork."""
+    env = base_env(a)
+    env["USE_VNNI"] = os.environ.get("USE_VNNI", "1")
+    env["MOE_PARALLEL"] = os.environ.get("MOE_PARALLEL", "1")
+    env["NUMA_INTERLEAVE"] = "1"
+    args = ["--mode", a.mode, "--prompt", a.prompt,
+            "--ngen", str(a.ngen), "--tf-tokens", str(a.tf_tokens),
+            "--model", model_dir(a), "--keep-server"]
+    script = os.path.join(ROOT, "tools", "cross_oracle_compare.py")
+    log(f"launching cross-oracle: {script} {' '.join(args)}")
+    sys.exit(subprocess.call(["python3", script] + args, env=env))
+
+
+def cmd_observability(a: argparse.Namespace) -> None:
+    """f15: cross-engine observability dashboard."""
+    script = os.path.join(ROOT, "tools", "observability.py")
+    args = ["--colibri", a.colibri, "--llamacpp", a.llamacpp,
+            "--dashboard", a.dashboard, "--json", a.json]
+    log(f"launching observability: {script} {' '.join(args)}")
+    sys.exit(subprocess.call(["python3", script] + args))
+
+
+def main():
     ap = argparse.ArgumentParser(prog="coli", description="colibri-m3 — MiniMax-M3 on disk-streamed experts")
     ap.add_argument("--model", default=os.environ.get("COLI_MODEL"))
     ap.add_argument("--cap", type=int, default=128, help="expert LRU slots per MoE layer")
@@ -316,6 +372,44 @@ def main() -> None:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.set_defaults(func=cmd_serve)
+
+    # f10: NUMA-aware deployment wrapper.
+    p = sub.add_parser("numa",
+                       help="run engine under numactl --interleave=all + thread pinning")
+    p.add_argument("engine_args", nargs="*",
+                   help="args passed through to coli (e.g. chat --planar --cap 256)")
+    p.set_defaults(func=cmd_numa)
+
+    # f11/f12/f13/f15: throughput benchmark with all perf features enabled.
+    p = sub.add_parser("bench",
+                       help="f13 throughput benchmark (target >=5 tok/s)")
+    p.add_argument("--ngen", type=int, default=200)
+    p.add_argument("--prompt", default="Once upon a time there lived a "
+                                       "humble programmer named Alice who")
+    p.add_argument("--vnni", type=int, default=1, help="1=use VNNI kernels (f11)")
+    p.add_argument("--moe-parallel", type=int, default=1,
+                   help="1=parallel MoE dispatch (f12)")
+    p.add_argument("--telemetry", default=None,
+                   help="write per-step telemetry to this path (f15)")
+    p.set_defaults(func=cmd_bench)
+
+    # f9: cross-oracle comparison vs llama.cpp fork.
+    p = sub.add_parser("cross-oracle",
+                       help="f9 cross-oracle comparison vs llama.cpp-minimax-m3-rq")
+    p.add_argument("--prompt", default="The quick brown fox jumps over the lazy dog")
+    p.add_argument("--ngen", type=int, default=20)
+    p.add_argument("--tf-tokens", type=int, default=32)
+    p.add_argument("--mode", choices=["greedy", "tf", "both"], default="both")
+    p.set_defaults(func=cmd_cross_oracle)
+
+    # f15: cross-engine observability dashboard.
+    p = sub.add_parser("observability",
+                       help="f15 cross-engine telemetry dashboard")
+    p.add_argument("--colibri", default=os.environ.get("COLI_TELEMETRY", ""))
+    p.add_argument("--llamacpp", default=os.environ.get("LLAMA_TELEMETRY", ""))
+    p.add_argument("--dashboard", default="tests/oracle/cross_engine_dashboard.md")
+    p.add_argument("--json", default="tests/oracle/cross_engine_summary.json")
+    p.set_defaults(func=cmd_observability)
 
     a = ap.parse_args()
     if a.dry_run:

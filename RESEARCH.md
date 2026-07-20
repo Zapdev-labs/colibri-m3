@@ -986,6 +986,41 @@ correctness oracle. Work is organized in three milestones:
 - **Benchmark suite**: cold-start time, warm-cache tok/s, expert cache hit rate,
   peak RSS, NUMA stats, comparison vs llama.cpp fork.
 
+
+
+### 8.5 Feature inventory (f8-f17)
+
+After the foundation (f1-f7, f16) was complete, the engine gained the
+following feature surface (commit IDs in git log):
+
+| Feature | Status | Surface |
+|---|---|---|
+| f8 oracle validation | Done (commits b531123, 7f7b344) | tests/oracle/{logits,greedy}.json + tools/test_oracle_{logits,greedy}.py; teacher-forcing mode in engine.c |
+| f9 cross-oracle comparison | Done | tools/cross_oracle_compare.py (drives both engines on identical prompts); scripts/run-cross-oracle.sh; tools/test_cross_oracle.py smoke |
+| f10 NUMA deployment | Done | src/numa.h (glibc-only, no libnuma dep); scripts/run-numa.sh wraps engine in numactl --interleave=all + thread pinning; env vars NUMA_INTERLEAVE / NUMA_PIN_THREADS |
+| f11 AVX-512 VNNI kernels | Done | src/vnni.h (matmul_i8_vnni + matmul_i4_vnni via _mm512_dpbusd_epi32); env var USE_VNNI; c/tests/test_vnni.c verifies bit-exact vs act-quant reference, <0.4% drift vs f32 reference |
+| f12 expert parallelism | Done | moe_parallel() in engine.c dispatches routed experts concurrently via #pragma omp parallel for + per-thread accumulators; env var MOE_PARALLEL |
+| f13 throughput target | Done | tools/bench_throughput.py (target >=5 tok/s, >=95% hit rate); scripts/run-bench.sh; tools/test_throughput.py smoke; RESULT_PATH tests/oracle/throughput_result.json |
+| f14 INT8 KV long context | Done | load_model auto-enables KV_I8=1 when ctx>=16384 (saves ~2 GB/32K vs BF16); c/tests/test_int8_kv.c verifies round-trip + 32K attention dot accuracy + budget |
+| f15 cross-engine observability | Done | src/observability.h (engine-side JSON-line telemetry); tools/llama_observability_wrapper.py (wraps llama-server, translates stderr to same schema); tools/observability.py (dashboard); docs/llama-cpp-rq-observability.patch (native fork patch, unapplied — fork stays read-only) |
+| f17 int8 attention quantization | Done (commit 4e000d0) | tools/requant_attn.py + tools/requant_attn_bf16.py produce m3_i4_v3 (int4 weights + int8 attention); verify_requant.py confirms dtype swap |
+
+### 8.6 Why f9/f15 keep the llama.cpp fork read-only
+
+The llama.cpp-minimax-m3-rq fork is the mission's independent int4 oracle
+(RESEARCH.md §7.2). Modifying it in place would compromise its role as a
+correctness reference: any divergence between colibri-m3 and the fork could
+be blamed on "we patched the oracle" rather than a real colibri bug. So:
+
+  - f9 (cross-oracle comparison) drives the fork's existing llama-server via
+    HTTP and compares its outputs against colibri-m3's. No fork modification.
+  - f15 (observability) wraps llama-server with tools/llama_observability_wrapper.py
+    which parses the fork's existing MSA telemetry (schema v3 from
+    src/models/msa-runtime.cpp) and re-emits it in the colibri-m3 JSON-line
+    schema. The native in-process patch
+    (docs/llama-cpp-rq-observability.patch) is provided but UNAPPLIED; users
+    who want lower-overhead emission can apply it to a fresh fork-of-fork.
+
 ### 8.4 Correctness methodology (replicated from Colibrì)
 
 Three-tier validation:
