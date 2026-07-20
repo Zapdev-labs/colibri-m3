@@ -21,7 +21,7 @@ IMPORTANT (per f8-oracle-validation feature spec):
         the 1e-3 HF tolerance because this is an int4-vs-Q4_K_M comparison).
 
 Usage:
-  python3 tools/test_oracle_logits.py [--model /home/ai/models/m3_i4_v2]
+  python3 tools/test_oracle_logits.py [--model /home/ai/models/m3_i4_v3]
                                        [--oracle tests/oracle/logits.json]
                                        [--topk 200]
 
@@ -40,7 +40,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v2")
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
 DEFAULT_ORACLE = ROOT / "tests" / "oracle" / "logits.json"
 
 # Tolerances per feature spec (relaxed for int4-vs-Q4_K_M drift).

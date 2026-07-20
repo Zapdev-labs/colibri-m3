@@ -14,7 +14,7 @@ Verifies that:
       on token 0 or any non-EOS token.
 
 Usage:
-  python3 tools/test_eos.py [--model /home/ai/models/m3_i4_v2]
+  python3 tools/test_eos.py [--model /home/ai/models/m3_i4_v3]
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v2")
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
 EOS_ID = 200020
 
 

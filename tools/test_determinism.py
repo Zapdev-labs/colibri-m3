@@ -18,7 +18,7 @@ Two modes are tested:
       produce the same token sequence. This catches time-seeding bugs.
 
 Usage:
-  python3 tools/test_determinism.py [--model /home/ai/models/m3_i4_v2]
+  python3 tools/test_determinism.py [--model /home/ai/models/m3_i4_v3]
                                     [--seed 424242] [--prompt "The capital of France is"]
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v2")
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
 DEFAULT_SEED = 424242
 DEFAULT_PROMPT = "The capital of France is"
 

@@ -1,7 +1,7 @@
 {
   "passed": false,
   "meets_contract_floor": false,
-  "matches": 3,
+  "matches": 16,
   "n": 20,
   "floor": 18,
   "contract_floor": 19,
@@ -9,23 +9,23 @@
     58841,
     1049,
     275,
-    275,
     34810,
     6787,
-    2822,
-    326,
-    494,
-    17406,
-    2803,
-    494,
-    2982,
-    1885,
-    3729,
-    3109,
-    3999,
-    382,
-    1592,
-    155657
+    46,
+    32,
+    10010,
+    26551,
+    39490,
+    48,
+    1866,
+    43,
+    424,
+    6426,
+    43,
+    424,
+    1973,
+    1456,
+    409
   ],
   "oracle_ids": [
     58841,
@@ -51,88 +51,23 @@
   ],
   "diffs": [
     {
-      "pos": 3,
-      "colibri": 275,
-      "oracle": 34810
-    },
-    {
-      "pos": 4,
-      "colibri": 34810,
-      "oracle": 6787
-    },
-    {
-      "pos": 5,
-      "colibri": 6787,
-      "oracle": 46
-    },
-    {
-      "pos": 6,
-      "colibri": 2822,
-      "oracle": 32
-    },
-    {
-      "pos": 7,
-      "colibri": 326,
-      "oracle": 10010
-    },
-    {
-      "pos": 8,
-      "colibri": 494,
-      "oracle": 26551
-    },
-    {
-      "pos": 9,
-      "colibri": 17406,
-      "oracle": 39490
-    },
-    {
-      "pos": 10,
-      "colibri": 2803,
-      "oracle": 48
-    },
-    {
-      "pos": 11,
-      "colibri": 494,
-      "oracle": 1866
-    },
-    {
-      "pos": 12,
-      "colibri": 2982,
-      "oracle": 43
-    },
-    {
-      "pos": 13,
-      "colibri": 1885,
-      "oracle": 424
-    },
-    {
       "pos": 14,
-      "colibri": 3729,
+      "colibri": 6426,
       "oracle": 5785
     },
     {
-      "pos": 15,
-      "colibri": 3109,
-      "oracle": 43
-    },
-    {
-      "pos": 16,
-      "colibri": 3999,
-      "oracle": 424
-    },
-    {
       "pos": 17,
-      "colibri": 382,
+      "colibri": 1973,
       "oracle": 1712
     },
     {
       "pos": 18,
-      "colibri": 1592,
+      "colibri": 1456,
       "oracle": 9563
     },
     {
       "pos": 19,
-      "colibri": 155657,
+      "colibri": 409,
       "oracle": 7951
     }
   ],

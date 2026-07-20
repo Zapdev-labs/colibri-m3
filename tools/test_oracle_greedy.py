@@ -14,7 +14,7 @@ match count and exit 0 when >=18/20 (the feature-spec floor), flagging
 whether the >=19/20 contract floor is also met.
 
 Usage:
-  python3 tools/test_oracle_greedy.py [--model /home/ai/models/m3_i4_v2]
+  python3 tools/test_oracle_greedy.py [--model /home/ai/models/m3_i4_v3]
                                       [--oracle tests/oracle/greedy.json]
                                       [--ngen 20]
 """
@@ -29,7 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v2")
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
 DEFAULT_ORACLE = ROOT / "tests" / "oracle" / "greedy.json"
 
 NGEN_DEFAULT = 20
