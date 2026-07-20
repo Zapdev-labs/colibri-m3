@@ -41,6 +41,13 @@ def base_env(a: argparse.Namespace) -> dict[str, str]:
         e["TOPP"] = str(a.topp)
     if a.topk is not None:
         e["TOPK"] = str(a.topk)
+    # f8: seeded determinism (VAL-CORR-018, VAL-CROSS-006)
+    if getattr(a, "seed", None) is not None:
+        e["SEED"] = str(a.seed)
+    # f8: numerical stability instrumentation (VAL-CORR-024)
+    if getattr(a, "debug_trace", False):
+        e["DEBUG_TRACE"] = "1"
+        e["M3_CHECK_NAN"] = "1"
     return e
 
 
@@ -268,6 +275,11 @@ def main() -> None:
     ap.add_argument("--topp", type=float, default=0.95)
     ap.add_argument("--topk", type=int, default=40)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="fixed RNG seed for reproducible sampling (VAL-CROSS-006)")
+    ap.add_argument("--debug-trace", action="store_true",
+                    help="dump per-tensor stats (min/max/mean) and assert no NaN/Inf "
+                         "(VAL-CORR-024; sets M3_CHECK_NAN=1 and DEBUG_TRACE=1)")
     ap.add_argument("--dry-run", action="store_true",
                     help="tensor-presence check: verify all expected tensors from "
                          "config.json are present in the snapshot before allocating memory")

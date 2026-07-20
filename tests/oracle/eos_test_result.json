@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "config_eos": 200020,
+  "expected_eos": 200020,
+  "tokens_emitted": 50,
+  "ngen": 50,
+  "eos_emitted": false,
+  "eos_position": -1,
+  "truncated_after_eos": false,
+  "halted_early": false
+}

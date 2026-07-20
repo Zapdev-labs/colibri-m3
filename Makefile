@@ -54,7 +54,38 @@ test-converter:
 	@echo "==> running converter unit tests"
 	@python3 tools/test_convert.py
 
+# f8-oracle-validation: oracle comparison + end-to-end correctness tests.
+# These drive the full engine on the 199GB int4 snapshot; each takes 5-15 min
+# (model load dominates). Run individually or via `make test-oracle-all`.
+test-oracle-logits:
+	@echo "==> running oracle teacher-forcing logits comparison (VAL-CORR-014)"
+	@python3 tools/test_oracle_logits.py
+
+test-oracle-greedy:
+	@echo "==> running oracle greedy decode comparison (VAL-CORR-015)"
+	@python3 tools/test_oracle_greedy.py
+
+test-eos:
+	@echo "==> running EOS honoring test (VAL-CORR-017)"
+	@python3 tools/test_eos.py
+
+test-determinism:
+	@echo "==> running seeded determinism test (VAL-CORR-018, VAL-CROSS-006)"
+	@python3 tools/test_determinism.py
+
+test-kv-cache:
+	@echo "==> running KV cache correctness test (VAL-CORR-019)"
+	@python3 tools/test_kv_cache.py
+
+test-nan:
+	@echo "==> running numerical stability test (VAL-CORR-024)"
+	@python3 tools/test_numerical_stability.py
+
+test-oracle-all: test-oracle-greedy test-oracle-logits test-eos test-determinism test-kv-cache test-nan
+
 test: test-converter test-c test-tokenizer
+	@echo "==> (oracle / e2e tests are gated behind 'make test-oracle-all' because they"
+	@echo "     each reload the 199GB model; run them explicitly when the host is free)"
 
 check:
 	@echo "==> lint gate: clean build with -Wall -Wextra (C static analysis)"

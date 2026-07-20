@@ -90,6 +90,17 @@ typedef struct {
 static float g_temp = 1.0f, g_topp = 0.95f;
 static int g_topk_samp = 40, g_planar_bits = 3;
 
+/* f8-oracle-validation: teacher-forcing, NaN/debug-trace, and seeded-determinism
+ * knobs. All are opt-in via env vars / CLI flags; defaults preserve the existing
+ * behavior (greedy when TEMP<=0, no TF dump, no nan instrumentation, time-seeded). */
+static int g_seed = 0;            /* 0 = time-seeded (legacy); >0 = fixed seed */
+static int g_tf_mode = 0;         /* 1 = teacher-force mode: dump top-K logprobs per position */
+static int g_tf_topk = 200;       /* top-K logprobs to dump per TF position (matches oracle) */
+static const char *g_tf_out_path = NULL;  /* TF dump file (default: stdout) */
+static int g_nan_check = 0;       /* 1 = M3_CHECK_NAN mode: assert no NaN/Inf in intermediates */
+static int g_debug_trace = 0;    /* 1 = DEBUG_TRACE mode: dump per-tensor stats (min/max/mean) */
+static long g_nan_failures = 0;   /* count of NaN/Inf failures detected */
+
 static double now_s(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -204,6 +215,76 @@ static void softmax(float *x, int n) {
         s += x[i];
     }
     for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* f8: NaN/Inf check + optional tensor-stats dump for M3_CHECK_NAN / DEBUG_TRACE.
+ * Called from layer_fwd / run_gen / run_teacher_force at every intermediate tensor.
+ * - M3_CHECK_NAN=1: prints "nan-check: L<layer> <kernel> OK" per (layer, kernel)
+ *   pair, or "nan-check: FAILED ..." on the first NaN/Inf element. The contract
+ *   (VAL-CORR-024) requires zero FAILED lines over a 50-token run.
+ * - DEBUG_TRACE=1: additionally prints per-tensor min/max/mean stats (the
+ *   --debug-trace mode the feature spec requests for dumping tensor stats).
+ * Both modes are opt-in via env vars; the default path incurs no overhead. */
+static void nan_check_layer(int layer, const char *kernel, const float *p, int64_t n) {
+    if (!g_nan_check && !g_debug_trace) return;
+    for (int64_t i = 0; i < n; i++) {
+        if (isnan(p[i]) || isinf(p[i])) {
+            fprintf(stderr, "nan-check: FAILED L%d %s at idx %lld val=%g\n",
+                    layer, kernel, (long long)i, (double)p[i]);
+            g_nan_failures++;
+            return;
+        }
+    }
+    if (g_debug_trace) {
+        float mn = p[0], mx = p[0];
+        double sum = 0.0;
+        for (int64_t i = 0; i < n; i++) {
+            float v = p[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            sum += (double)v;
+        }
+        fprintf(stderr, "trace: L%d %-28s n=%lld min=%.6g max=%.6g mean=%.6g\n",
+                layer, kernel, (long long)n, (double)mn, (double)mx,
+                sum / (double)n);
+    } else {
+        fprintf(stderr, "nan-check: L%d %-28s OK\n", layer, kernel);
+    }
+}
+
+/* f8: logsoftmax + top-K selection over the full vocabulary.
+ * Computes logsoftmax(logits) over V entries, then selects the top-K token IDs
+ * by logprob (descending). Used by teacher-forcing mode to dump per-position
+ * top-K logprobs in the same format as the oracle's `per_position[].top` array
+ * (each entry is [token_id, logprob]). O(K*V) — ~40M comparisons for K=200,
+ * V=200064, ~50ms per position on the remote Xeon. */
+static void logsoftmax_topk(const float *logits, int V, int K,
+                            int *out_ids, float *out_lps) {
+    if (V <= 0 || K <= 0) return;
+    float mx = logits[0];
+    for (int i = 1; i < V; i++)
+        if (logits[i] > mx) mx = logits[i];
+    double sum = 0.0;
+    for (int i = 0; i < V; i++) sum += exp((double)(logits[i] - mx));
+    float lse = (float)((double)mx + log(sum));
+    size_t Vs = (size_t)V;
+    char *taken = (char *)calloc(Vs > 0 ? Vs : 1, 1);
+    int kmax = K < V ? K : V;
+    for (int k = 0; k < kmax; k++) {
+        int best = -1;
+        float bv = -1e30f;
+        for (int i = 0; i < V; i++) {
+            if (!taken[i] && logits[i] > bv) {
+                bv = logits[i];
+                best = i;
+            }
+        }
+        if (best < 0) break;
+        taken[best] = 1;
+        out_ids[k] = best;
+        out_lps[k] = logits[best] - lse;
+    }
+    free(taken);
 }
 
 /* Partial rotate-half RoPE on first rotary_dim channels */
@@ -836,13 +917,13 @@ static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int po
     /* 2. QK norm + partial RoPE + K/V cache store (mirrors dense path) */
     for (int h = 0; h < H; h++) {
         float *qh = Q + (int64_t)h * hd;
-        if (l->qn) rmsnorm(qh, qh, l->qn, hd, c->eps, 0);
+        if (l->qn) rmsnorm(qh, qh, l->qn, hd, c->eps, c->gemma_norm);
         rope(qh, pos, c->theta, hd, c->rotary_dim);
     }
     for (int kh = 0; kh < Hkv; kh++) {
         float *kk = Kp + (int64_t)kh * hd;
         float *vv = Vp + (int64_t)kh * hd;
-        if (l->kn) rmsnorm(kk, kk, l->kn, hd, c->eps, 0);
+        if (l->kn) rmsnorm(kk, kk, l->kn, hd, c->eps, c->gemma_norm);
         rope(kk, pos, c->theta, hd, c->rotary_dim);
         int64_t off = ((int64_t)kh * m->max_t + pos) * hd;
         int64_t soff = (int64_t)kh * m->max_t + pos;
@@ -875,10 +956,10 @@ static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int po
     matmul_qt(ikt, x, &l->ik, 1);   /* [idx_dim] */
     for (int h = 0; h < idx_heads; h++) {
         float *iqh = iq + (int64_t)h * idx_dim;
-        if (l->iqn) rmsnorm(iqh, iqh, l->iqn, idx_dim, c->eps, 0);
+        if (l->iqn) rmsnorm(iqh, iqh, l->iqn, idx_dim, c->eps, c->gemma_norm);
         rope(iqh, pos, c->theta, idx_dim, c->rotary_dim);
     }
-    if (l->ikn) rmsnorm(ikt, ikt, l->ikn, idx_dim, c->eps, 0);
+    if (l->ikn) rmsnorm(ikt, ikt, l->ikn, idx_dim, c->eps, c->gemma_norm);
     rope(ikt, pos, c->theta, idx_dim, c->rotary_dim);
     memcpy(m->Kidx[layer] + (int64_t)pos * idx_dim, ikt, (size_t)idx_dim * sizeof(float));
 
@@ -932,13 +1013,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos0, 
         int pos = pos0 + s;
         for (int h = 0; h < H; h++) {
             float *qh = Q + (int64_t)s * H * hd + (int64_t)h * hd;
-            if (l->qn) rmsnorm(qh, qh, l->qn, hd, c->eps, 0);
+            if (l->qn) rmsnorm(qh, qh, l->qn, hd, c->eps, c->gemma_norm);
             rope(qh, pos, c->theta, hd, c->rotary_dim);
         }
         for (int kh = 0; kh < Hkv; kh++) {
             float *kk = Kp + (int64_t)s * Hkv * hd + (int64_t)kh * hd;
             float *vv = Vp + (int64_t)s * Hkv * hd + (int64_t)kh * hd;
-            if (l->kn) rmsnorm(kk, kk, l->kn, hd, c->eps, 0);
+            if (l->kn) rmsnorm(kk, kk, l->kn, hd, c->eps, c->gemma_norm);
             rope(kk, pos, c->theta, hd, c->rotary_dim);
             int64_t off = ((int64_t)kh * m->max_t + pos) * hd;
             int64_t soff = (int64_t)kh * m->max_t + pos;
@@ -1138,12 +1219,17 @@ static void layer_fwd(Model *m, int li, float *x, int S, int pos0, float *nrm, f
     Cfg *c = &m->c;
     int D = c->hidden;
     for (int s = 0; s < S; s++) rmsnorm(nrm + (int64_t)s * D, x + (int64_t)s * D, l->in_ln, D, c->eps, c->gemma_norm);
+    if (g_nan_check || g_debug_trace) nan_check_layer(li, "rmsnorm_in", nrm, (int64_t)S * D);
     attention(m, l, li, nrm, S, pos0, tmp);
+    if (g_nan_check || g_debug_trace) nan_check_layer(li, "attn_out", tmp, (int64_t)S * D);
     for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
     for (int s = 0; s < S; s++) rmsnorm(nrm + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps, c->gemma_norm);
+    if (g_nan_check || g_debug_trace) nan_check_layer(li, "post_ln", nrm, (int64_t)S * D);
     if (l->sparse) moe(m, l, li, nrm, S, tmp);
     else dense_mlp(m, l, nrm, S, tmp);
+    if (g_nan_check || g_debug_trace) nan_check_layer(li, "mlp_out", tmp, (int64_t)S * D);
     for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
+    if (g_nan_check || g_debug_trace) nan_check_layer(li, "residual", x, (int64_t)S * D);
 }
 
 static void embed_tok(Model *m, int tok, float *x) {
@@ -1263,6 +1349,7 @@ static int run_gen(Model *m, const int *prompt, int np, int max_new) {
     fprintf(stderr, "\n[prefill] done in %.2fs\n", now_s() - t0);
     rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
     matmul_qt(logits, nrm, &m->lm_head, 1);
+    if (g_nan_check || g_debug_trace) nan_check_layer(-1, "lm_head_logits", logits, c->vocab);
     int pos = np;
     t0 = now_s();
     int emitted = 0;
@@ -1271,22 +1358,108 @@ static int run_gen(Model *m, const int *prompt, int np, int max_new) {
         printf("%d\n", tok);
         fflush(stdout);
         emitted++;
-        if (tok == c->eos) break;
+        if (tok == c->eos) {
+            fprintf(stderr, "[gen] token %d=%d (EOS) -> stopping\n", t, tok);
+            break;
+        }
         embed_tok(m, tok, x);
         for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, pos, nrm, tmp);
         pos++;
         rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
         matmul_qt(logits, nrm, &m->lm_head, 1);
+        if (g_nan_check || g_debug_trace) nan_check_layer(-1, "lm_head_logits", logits, c->vocab);
     }
     double dt = now_s() - t0;
     double tot = (double)(m->hits + m->miss);
     fprintf(stderr, "[stat] %d tok in %.2fs (%.2f tok/s) | expert hit %.1f%%\n", emitted, dt,
             emitted / (dt > 1e-6 ? dt : 1e-6), tot ? 100.0 * m->hits / tot : 0.0);
+    if (g_nan_check) {
+        fprintf(stderr, "[nan-check] %ld failures detected over %d tokens\n",
+                g_nan_failures, emitted);
+        if (g_nan_failures > 0) return 1;
+    }
     free(x);
     free(nrm);
     free(tmp);
     free(logits);
     return 0;
+}
+
+/* f8: teacher-forcing mode — feed the oracle's target tokens (instead of sampling)
+ * and dump per-position top-K logprobs so test_oracle_logits.py can compare them
+ * against the cached oracle artifacts (tests/oracle/logits.json).
+ *
+ * stdin protocol extension: a third line with space-separated target token IDs.
+ * Output: a simple line-based dump to g_tf_out_path (default: stdout):
+ *   TF_START npos=<N> topk=<K> vocab=<V>
+ *   POS <i> argmax=<id> argmax_lp=<v> ntop=<K>
+ *   <tok_id> <logprob>     (repeated ntop times, sorted by logprob desc)
+ *   ...
+ *   TF_END
+ *
+ * This is the format test_oracle_logits.py parses. The comparison uses the
+ * relaxed tolerances documented in the feature spec (int4-vs-Q4_K_M drift):
+ *   (a) argmax match: target 32/32, allow >=30/32
+ *   (b) top-200 overlap: >=90% per position
+ *   (c) overlapping logprob values: within 1e-2
+ */
+static int run_teacher_force(Model *m, const int *prompt, int np,
+                             const int *targets, int nt, int topk, FILE *tf_out) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *x = falloc(D), *nrm = falloc(D), *tmp = falloc(D), *logits = falloc(c->vocab);
+    double t0 = now_s();
+    for (int i = 0; i < np; i++) {
+        embed_tok(m, prompt[i], x);
+        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, i, nrm, tmp);
+        if ((i + 1) == np || ((i + 1) % 32) == 0)
+            fprintf(stderr, "\r[tf-prefill] %d/%d", i + 1, np);
+    }
+    fprintf(stderr, "\n[tf-prefill] done in %.2fs\n", now_s() - t0);
+    rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+    matmul_qt(logits, nrm, &m->lm_head, 1);
+    if (g_nan_check || g_debug_trace) nan_check_layer(-1, "lm_head_logits", logits, c->vocab);
+
+    int *top_ids = (int *)malloc((size_t)topk * sizeof(int));
+    float *top_lps = (float *)malloc((size_t)topk * sizeof(float));
+    int pos = np;
+    int kmax = topk < c->vocab ? topk : c->vocab;
+
+    fprintf(tf_out, "TF_START npos=%d topk=%d vocab=%d\n", nt, topk, c->vocab);
+    for (int t = 0; t < nt; t++) {
+        logsoftmax_topk(logits, c->vocab, topk, top_ids, top_lps);
+        int argmax = (kmax > 0) ? top_ids[0] : -1;
+        float argmax_lp = (kmax > 0) ? top_lps[0] : 0.0f;
+        fprintf(tf_out, "POS %d argmax=%d argmax_lp=%.9g ntop=%d\n",
+                t, argmax, (double)argmax_lp, kmax);
+        for (int k = 0; k < kmax; k++)
+            fprintf(tf_out, "%d %.9g\n", top_ids[k], (double)top_lps[k]);
+
+        /* Feed the oracle's target token (teacher forcing) and advance the
+         * KV cache — NOT the sampled token. This is what distinguishes TF from
+         * greedy decode and ensures we compare logits at the exact same
+         * prefixes the oracle used. */
+        int tok = targets[t];
+        embed_tok(m, tok, x);
+        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, pos, nrm, tmp);
+        pos++;
+        rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+        matmul_qt(logits, nrm, &m->lm_head, 1);
+        if (g_nan_check || g_debug_trace) nan_check_layer(-1, "lm_head_logits", logits, c->vocab);
+    }
+    fprintf(tf_out, "TF_END\n");
+
+    if (g_nan_check) {
+        fprintf(stderr, "[nan-check] %ld failures detected over %d TF positions\n",
+                g_nan_failures, nt);
+    }
+    free(top_ids);
+    free(top_lps);
+    free(x);
+    free(nrm);
+    free(tmp);
+    free(logits);
+    return (g_nan_check && g_nan_failures > 0) ? 1 : 0;
 }
 
 /* ---------- dry-run: tensor-presence check ---------- *
@@ -1454,27 +1627,54 @@ int main(int argc, char **argv) {
     if (!snap) {
         fprintf(stderr, "usage: SNAP=<model_dir> ./m3 [cache] [ebits] [dbits] [ctx]\n");
         fprintf(stderr, "       SNAP=<model_dir> ./m3 --dry-run\n");
+        fprintf(stderr, "       SNAP=<model_dir> ./m3 --teacher-force [cache] [ebits] [dbits] [ctx]\n");
+        fprintf(stderr, "  env: SEED=<n> TF_MODE=1 TF_OUT=<path> TF_TOPK=200\n");
+        fprintf(stderr, "       M3_CHECK_NAN=1 DEBUG_TRACE=1 TEMP=<t> TOPP=<p> TOPK=<k>\n");
         return 1;
     }
     /* --dry-run: tensor-presence check before allocating memory */
     if (argc > 1 && !strcmp(argv[1], "--dry-run")) {
         return dry_run(snap);
     }
-    int cap = argc > 1 ? atoi(argv[1]) : 128;
-    int ebits = argc > 2 ? atoi(argv[2]) : 4;
-    int dbits = argc > 3 ? atoi(argv[3]) : 8;
-    int ctx = argc > 4 ? atoi(argv[4]) : 4096;
+
+    /* f8: teacher-force mode flag. Also settable via TF_MODE=1 env var. */
+    int argi = 1;
+    if (argc > 1 && !strcmp(argv[1], "--teacher-force")) {
+        g_tf_mode = 1;
+        argi = 2;
+    }
+
+    int cap = argc > argi ? atoi(argv[argi]) : 128;
+    int ebits = argc > argi + 1 ? atoi(argv[argi + 1]) : 4;
+    int dbits = argc > argi + 2 ? atoi(argv[argi + 2]) : 8;
+    int ctx = argc > argi + 3 ? atoi(argv[argi + 3]) : 4096;
     if (getenv("TEMP")) g_temp = (float)atof(getenv("TEMP"));
     if (getenv("TOPP")) g_topp = (float)atof(getenv("TOPP"));
     if (getenv("TOPK")) g_topk_samp = atoi(getenv("TOPK"));
     if (getenv("PLANAR_BITS")) g_planar_bits = atoi(getenv("PLANAR_BITS"));
-    srand((unsigned)time(NULL));
+    if (getenv("TF_MODE")) g_tf_mode = atoi(getenv("TF_MODE"));
+    if (getenv("TF_TOPK")) g_tf_topk = atoi(getenv("TF_TOPK"));
+    if (getenv("TF_OUT")) g_tf_out_path = getenv("TF_OUT");
+    if (getenv("M3_CHECK_NAN")) g_nan_check = atoi(getenv("M3_CHECK_NAN"));
+    if (getenv("DEBUG_TRACE")) g_debug_trace = atoi(getenv("DEBUG_TRACE"));
+
+    /* f8: seeded determinism. SEED=0 (or unset) => legacy time-seeded path;
+     * SEED>0 => fixed seed for reproducible sampling (VAL-CORR-018, VAL-CROSS-006). */
+    if (getenv("SEED")) g_seed = atoi(getenv("SEED"));
+    if (g_seed > 0) {
+        srand((unsigned)g_seed);
+        fprintf(stderr, "[seed] %d (fixed)\n", g_seed);
+    } else {
+        srand((unsigned)time(NULL));
+        fprintf(stderr, "[seed] time-seeded\n");
+    }
 
     Model m;
     load_model(&m, snap, ebits, dbits, cap, ctx);
     fprintf(stderr, "READY\n");
 
-    /* stdin protocol: first line = max_new, second line = space-separated prompt token ids */
+    /* stdin protocol: first line = max_new, second line = space-separated prompt token ids.
+     * In teacher-force mode, a third line = space-separated target token ids. */
     char line[1 << 20];
     if (!fgets(line, sizeof(line), stdin)) return 0;
     int max_new = atoi(line);
@@ -1492,6 +1692,40 @@ int main(int argc, char **argv) {
         fprintf(stderr, "empty prompt\n");
         return 2;
     }
+
+    if (g_tf_mode) {
+        /* teacher-force: read target token IDs (third line) */
+        int targets[8192], nt = 0;
+        if (!fgets(line, sizeof(line), stdin)) {
+            fprintf(stderr, "TF_MODE: missing target token line on stdin\n");
+            return 2;
+        }
+        p = line; end = NULL;
+        while (nt < 8192) {
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            targets[nt++] = (int)v;
+            p = end;
+        }
+        if (nt < 1) {
+            fprintf(stderr, "TF_MODE: empty target list\n");
+            return 2;
+        }
+        if (nt < max_new) max_new = nt;
+        fprintf(stderr, "[tf] prompt=%d tokens, targets=%d, topk=%d\n", np, nt, g_tf_topk);
+        FILE *tf_out = stdout;
+        if (g_tf_out_path && strcmp(g_tf_out_path, "-") != 0) {
+            tf_out = fopen(g_tf_out_path, "w");
+            if (!tf_out) {
+                perror(g_tf_out_path);
+                return 2;
+            }
+        }
+        int rc = run_teacher_force(&m, prompt, np, targets, max_new, g_tf_topk, tf_out);
+        if (tf_out != stdout) fclose(tf_out);
+        return rc;
+    }
+
     fprintf(stderr, "[run] prompt=%d tokens, max_new=%d\n", np, max_new);
     return run_gen(&m, prompt, np, max_new);
 }
