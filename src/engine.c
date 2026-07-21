@@ -917,6 +917,8 @@ static inline void msa_kv_read(Model *m, int layer, int kv_head, int t,
  * selected: [topk]                     — selected block indices (from msa_topk_select)
  * out:      [n_q_in_group * head_dim]  — attention output (zeroed on entry)
  */
+static float *g_msa_kbuf=NULL,*g_msa_vbuf=NULL,*g_msa_sc=NULL;
+static int g_msa_buf_sz=0;
 static void msa_group_attention(Model *m, int layer, int kv_head,
                                 const float *Q, const int *selected, int topk,
                                 int n_q_in_group, int head_dim, int pos,
@@ -937,8 +939,15 @@ static void msa_group_attention(Model *m, int layer, int kv_head,
     }
     if (ngather == 0) return;
 
-    float *kbuf = (float *)malloc((size_t)ngather * head_dim * sizeof(float));
-    float *vbuf = (float *)malloc((size_t)ngather * head_dim * sizeof(float));
+    int _need = ngather * head_dim;
+    if (_need > g_msa_buf_sz) {
+        free(g_msa_kbuf); free(g_msa_vbuf); free(g_msa_sc);
+        g_msa_kbuf = (float *)malloc((size_t)_need * sizeof(float));
+        g_msa_vbuf = (float *)malloc((size_t)_need * sizeof(float));
+        g_msa_sc = (float *)malloc((size_t)ngather * sizeof(float));
+        g_msa_buf_sz = _need;
+    }
+    float *kbuf = g_msa_kbuf, *vbuf = g_msa_vbuf;
     for (int i = 0; i < ngather; i++) {
         msa_kv_read(m, layer, kv_head, gather_idx[i], kbuf + (int64_t)i * head_dim, head_dim, 0);
         msa_kv_read(m, layer, kv_head, gather_idx[i], vbuf + (int64_t)i * head_dim, head_dim, 1);
@@ -946,7 +955,7 @@ static void msa_group_attention(Model *m, int layer, int kv_head,
 
     for (int h = 0; h < n_q_in_group; h++) {
         const float *qh = Q + (int64_t)h * head_dim;
-        float *sc = (float *)malloc((size_t)ngather * sizeof(float));
+        float *sc = g_msa_sc;
         float mx = -1e30f;
         for (int i = 0; i < ngather; i++) {
             sc[i] = dot_f(qh, kbuf + (int64_t)i * head_dim, head_dim) * scale;
@@ -962,10 +971,23 @@ static void msa_group_attention(Model *m, int layer, int kv_head,
         memset(oh, 0, (size_t)head_dim * sizeof(float));
         for (int i = 0; i < ngather; i++)
             axpy_f(oh, vbuf + (int64_t)i * head_dim, sc[i] * inv, head_dim);
-        free(sc);
+        /* sc persistent */
     }
-    free(kbuf);
-    free(vbuf);
+    /* kbuf/vbuf persistent */
+}
+
+/* Persistent attention + MSA scratch buffers — allocated once, reused. */
+static float *g_attn_Q=NULL,*g_attn_Kp=NULL,*g_attn_Vp=NULL;
+static float *g_attn_ctx=NULL,*g_attn_iq=NULL,*g_attn_ikt=NULL,*g_attn_scores=NULL;
+static int g_attn_qsz=0, g_attn_kv=0;
+
+static void attn_scratch_init(int qsz,int kv,int ih,int idm,int nb){
+  if(qsz==g_attn_qsz&&kv==g_attn_kv)return;
+  free(g_attn_Q);free(g_attn_Kp);free(g_attn_Vp);free(g_attn_ctx);
+  free(g_attn_iq);free(g_attn_ikt);free(g_attn_scores);
+  g_attn_Q=falloc(qsz);g_attn_Kp=falloc(kv);g_attn_Vp=falloc(kv);
+  g_attn_ctx=falloc(qsz);g_attn_iq=falloc(ih*idm);g_attn_ikt=falloc(idm);
+  g_attn_scores=falloc(ih*nb);g_attn_qsz=qsz;g_attn_kv=kv;
 }
 
 /* Full MSA attention pass for one token (S must be 1).
@@ -986,7 +1008,9 @@ static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int po
 
     /* 1. QKV projection (same matrices as dense path) */
     int64_t qsz = (int64_t)S * H * hd, kv = (int64_t)S * Hkv * hd;
-    float *Q = falloc(qsz), *Kp = falloc(kv), *Vp = falloc(kv);
+    int n_blocks = (m->max_t + blk_size - 1) / blk_size;
+    attn_scratch_init(qsz, kv, idx_heads, idx_dim, n_blocks);
+    float *Q = g_attn_Q, *Kp = g_attn_Kp, *Vp = g_attn_Vp;
     matmul_qt(Q, x, &l->q, S);
     matmul_qt(Kp, x, &l->k, S);
     matmul_qt(Vp, x, &l->v, S);
@@ -1028,8 +1052,8 @@ static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int po
     }
 
     /* 3. Indexer forward: project to idx_dim, per-head RMSNorm, partial RoPE, cache K */
-    float *iq = falloc((int64_t)idx_heads * idx_dim);
-    float *ikt = falloc(idx_dim);
+    float *iq = g_attn_iq;
+    float *ikt = g_attn_ikt;
     matmul_qt(iq, x, &l->iq, 1);    /* [idx_heads * idx_dim] */
     matmul_qt(ikt, x, &l->ik, 1);   /* [idx_dim] */
     for (int h = 0; h < idx_heads; h++) {
@@ -1042,12 +1066,11 @@ static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int po
     memcpy(m->Kidx[layer] + (int64_t)pos * idx_dim, ikt, (size_t)idx_dim * sizeof(float));
 
     /* 4. Per-GQA-group block selection + sparse attention */
-    int n_blocks = (m->max_t + blk_size - 1) / blk_size;
-    float *scores = falloc((int64_t)idx_heads * n_blocks);
+    float *scores = g_attn_scores;
     msa_indexer_scores(iq, m->Kidx[layer], pos, idx_heads, idx_dim,
                        m->max_t, blk_size, n_blocks, scores);
 
-    float *ctx = falloc(qsz);
+    float *ctx = g_attn_ctx;
     memset(ctx, 0, (size_t)qsz * sizeof(float));
     for (int g = 0; g < Hkv; g++) {
         int selected[64];   /* topk_blk max (16) */
@@ -1066,7 +1089,7 @@ static void attention_msa(Model *m, Layer *l, int layer, float *x, int S, int po
         fprintf(stderr, "[layer %d] sparse (16 blocks)\n", layer);
     }
 
-    free(Q); free(Kp); free(Vp); free(ctx); free(iq); free(ikt); free(scores);
+    /* scratch buffers persistent */
 }
 
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos0, float *out) {
