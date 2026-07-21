@@ -1190,16 +1190,24 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos0, 
     free(ctx);
 }
 
+static float *g_dense_g = NULL, *g_dense_u = NULL;
+static int g_dense_I = 0;
+
 static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     Cfg *c = &m->c;
+    int D = c->hidden;
     int I = c->dense_inter;
-    float *g = falloc((int64_t)S * I), *u = falloc((int64_t)S * I);
+    if (I != g_dense_I) {
+        free(g_dense_g); free(g_dense_u);
+        g_dense_g = falloc((int64_t)S * I);
+        g_dense_u = falloc((int64_t)S * I);
+        g_dense_I = I;
+    }
+    float *g = g_dense_g, *u = g_dense_u;
     matmul_qt(g, x, &l->gate, S);
     matmul_qt(u, x, &l->up, S);
     for (int64_t i = 0; i < (int64_t)S * I; i++) g[i] = swiglu(g[i], u[i], c->sw_alpha, c->sw_limit);
     matmul_qt(out, g, &l->down, S);
-    free(g);
-    free(u);
 }
 
 /* MiniMax M3 MoE router (sigmoid + e_score_correction_bias + route_norm + top-K).
@@ -1444,6 +1452,13 @@ static void layer_fwd(Model *m, int li, float *x, int S, int pos0, float *nrm, f
     } else dense_mlp(m, l, nrm, S, tmp);
     if (g_nan_check || g_debug_trace) nan_check_layer(li, "mlp_out", tmp, (int64_t)S * D);
     for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
+    /* Prefetch first cache line of next layer's weights to reduce stall */
+    if (li + 1 < c->layers) {
+        Layer *nl = &m->L[li + 1];
+        if (nl->q.q4) __builtin_prefetch(nl->q.q4, 0, 0);
+        if (nl->k.q4) __builtin_prefetch(nl->k.q4, 0, 0);
+        if (nl->v.q4) __builtin_prefetch(nl->v.q4, 0, 0);
+    }
     if (g_nan_check || g_debug_trace) nan_check_layer(li, "residual", x, (int64_t)S * D);
 }
 
