@@ -160,6 +160,10 @@ static void st_read(shards *S, const char *name, void *dst, int64_t n) {
     }
     st_tensor *t = &S->t[i];
     if (n > t->nbytes) n = t->nbytes;
+    /* Prefetch: tell kernel we need these pages soon (readahead). */
+#if defined(__linux__)
+    posix_fadvise(t->fd, t->off, n, POSIX_FADV_WILLNEED);
+#endif
     int64_t got = 0;
     while (got < n) {
         ssize_t r = pread(t->fd, (char *)dst + got, (size_t)(n - got), t->off + got);
@@ -169,9 +173,9 @@ static void st_read(shards *S, const char *name, void *dst, int64_t n) {
         }
         got += r;
     }
-#if defined(__linux__)
-    posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
-#endif
+    /* DO NOT call POSIX_FADV_DONTNEED — keep pages in OS page cache so
+     * repeated expert loads hit cache instead of disk. With 368GB RAM and
+     * a 212GB model, the full model fits in page cache. */
 }
 static st_tensor *st_get(shards *S, const char *name) {
     int i = st_find(S, name);

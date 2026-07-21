@@ -699,6 +699,15 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
             if (m->L[i].msa) m->Kidx[i] = falloc(idx_slot);
         }
     }
+    /* Prewarm: pull dense + shared expert weights into page cache by
+     * advising sequential access on all shard fds. The actual prewarm
+     * read happens for dense layers (small) and shared experts (medium).
+     * Routed experts are lazily loaded on demand (too large to prewarm all). */
+    for (int i = 0; i < m->S.nfd; i++) {
+#if defined(__linux__)
+        posix_fadvise(m->S.fds[i], 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
     fprintf(stderr, "[load] ready in %.1fs | expert cache %d/layer | kv_%s | msa_layers=%d\n",
             now_s() - t0, ecap,
             m->planar ? "planar" : (m->kv_i8 ? "i8" : "f32"), m->msa_layers);
