@@ -98,7 +98,9 @@ static int g_topk_samp = 40, g_planar_bits = 3;
  * behavior (greedy when TEMP<=0, no TF dump, no nan instrumentation, time-seeded). */
 static int g_seed = 0;            /* 0 = time-seeded (legacy); >0 = fixed seed */
 static int g_tf_mode = 0;         /* 1 = teacher-force mode: dump top-K logprobs per position */
-static int g_moe_parallel = 0;   /* f12: 1 = dispatch routed experts concurrently across OMP threads */
+static int g_moe_parallel = 0;   /* f12: 1 = parallel MoE expert dispatch */
+static int g_use_avx512_i4 = 0; /* opt-in AVX-512 i4 FMA kernel (slower for memory-bound workloads) */
+static int g_bench_mode = 0;     /* f13: 1 = native C benchmark mode (per-token timing + JSON summary) */
 static NumaTopo g_numa;          /* f10: discovered NUMA topology (zeroed until numa_discover) */
 static int g_tf_topk = 200;       /* top-K logprobs to dump per TF position (matches oracle) */
 static const char *g_tf_out_path = NULL;  /* TF dump file (default: stdout) */
@@ -412,8 +414,9 @@ static void matmul_qt(float *y, const float *x, QT *w, int S) {
         if (g_use_vnni) matmul_i8_vnni(y, x, w->q8, w->s, S, w->I, w->O);
         else            matmul_i8(y, x, w->q8, w->s, S, w->I, w->O);
     } else {
-        if (g_use_vnni) matmul_i4_vnni(y, x, w->q4, w->s, S, w->I, w->O);
-        else            matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
+        if (g_use_vnni)      matmul_i4_vnni(y, x, w->q4, w->s, S, w->I, w->O);
+        else if (g_use_avx512_i4) matmul_i4_avx512(y, x, w->q4, w->s, S, w->I, w->O);
+        else                matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
     }
 }
 
@@ -1218,20 +1221,31 @@ static void moe_parallel(Model *m, Layer *l, int layer, float *x, int S, float *
 
     int T = omp_get_max_threads();
     if (T < 1) T = 1;
-    /* Per-thread accumulators. Allocated as one contiguous block for locality. */
+    /* Per-thread accumulators. */
     float *acc = (float *)calloc((size_t)T * S * D, sizeof(float));
-    float *xg_priv = (float *)malloc((size_t)S * D);
-    float *gg = falloc((size_t)S * I), *uu = falloc((size_t)S * I),
-          *hh = falloc((size_t)S * D);
-    int *rows = (int *)malloc((size_t)S * sizeof(int));
-    float *rw = (float *)malloc((size_t)S * sizeof(float));
 
-    #pragma omp parallel for schedule(dynamic, 1) firstprivate(gg, uu, hh, rows, rw, xg_priv)
+    /* Pre-load all unique experts SERIALLY — expert_get() modifies the shared
+     * cache (m->cn[layer], m->cache[layer]) and is NOT thread-safe. Doing this
+     * before the parallel for avoids the race. The expert matmuls (the
+     * expensive part) still run in parallel below. */
+    ESlot **eslots = (ESlot **)malloc((size_t)nu * sizeof(ESlot *));
+    for (int j = 0; j < nu; j++)
+        eslots[j] = expert_get(m, layer, uniq[j]);
+
+    #pragma omp parallel for schedule(dynamic, 1)
     for (int j = 0; j < nu; j++) {
         int tid = omp_get_thread_num();
         float *my_acc = acc + (int64_t)tid * S * D;
+        /* Per-thread scratch buffers — allocated inside the loop to avoid races. */
+        float *xg_priv = (float *)malloc((size_t)S * D * sizeof(float));
+        float *gg_priv = (float *)malloc((size_t)S * I * sizeof(float));
+        float *uu_priv = (float *)malloc((size_t)S * I * sizeof(float));
+        float *hh_priv = (float *)malloc((size_t)S * D * sizeof(float));
+        int *rows = (int *)malloc((size_t)S * sizeof(int));
+        float *rw = (float *)malloc((size_t)S * sizeof(float));
+
         int eid = uniq[j];
-        ESlot *e = expert_get(m, layer, eid);
+        ESlot *e = eslots[j];
         int nr = 0;
         for (int s = 0; s < S; s++)
             for (int kk = 0; kk < K; kk++)
@@ -1241,16 +1255,17 @@ static void moe_parallel(Model *m, Layer *l, int layer, float *x, int S, float *
                 }
         for (int r = 0; r < nr; r++)
             memcpy(xg_priv + (int64_t)r * D, x + (int64_t)rows[r] * D, (size_t)D * sizeof(float));
-        matmul_qt(gg, xg_priv, &e->g, nr);
-        matmul_qt(uu, xg_priv, &e->u, nr);
+        matmul_qt(gg_priv, xg_priv, &e->g, nr);
+        matmul_qt(uu_priv, xg_priv, &e->u, nr);
         for (int64_t z = 0; z < (int64_t)nr * I; z++)
-            gg[z] = swiglu(gg[z], uu[z], c->sw_alpha, c->sw_limit);
-        matmul_qt(hh, gg, &e->d, nr);
+            gg_priv[z] = swiglu(gg_priv[z], uu_priv[z], c->sw_alpha, c->sw_limit);
+        matmul_qt(hh_priv, gg_priv, &e->d, nr);
         for (int r = 0; r < nr; r++) {
-            float w = rw[r]; float *hr = hh + (int64_t)r * D;
+            float w = rw[r]; float *hr = hh_priv + (int64_t)r * D;
             float *os = my_acc + (int64_t)rows[r] * D;
             for (int d = 0; d < D; d++) os[d] += w * hr[d];
         }
+        free(xg_priv); free(gg_priv); free(uu_priv); free(hh_priv); free(rows); free(rw);
     }
     /* Reduce per-thread accumulators into out. */
     for (int tid = 0; tid < T; tid++) {
@@ -1259,7 +1274,8 @@ static void moe_parallel(Model *m, Layer *l, int layer, float *x, int S, float *
     }
 
     /* Shared expert — same as sequential path, runs once after routed experts. */
-    float *sg = falloc((int64_t)S * sI), *su = falloc((int64_t)S * sI);
+    float *sg = falloc((int64_t)S * sI), *su = falloc((int64_t)S * sI),
+          *hh = falloc((int64_t)S * D);
     matmul_qt(sg, x, &l->sh_gate, S);
     matmul_qt(su, x, &l->sh_up, S);
     for (int64_t z = 0; z < (int64_t)S * sI; z++)
@@ -1267,8 +1283,7 @@ static void moe_parallel(Model *m, Layer *l, int layer, float *x, int S, float *
     matmul_qt(hh, sg, &l->sh_down, S);
     for (int64_t z = 0; z < (int64_t)S * D; z++) out[z] += hh[z];
 
-    free(acc); free(xg_priv); free(gg); free(uu); free(hh);
-    free(rows); free(rw); free(sg); free(su);
+    free(acc); free(eslots); free(sg); free(su); free(hh);
     free(logit); free(choice); free(idxs); free(ws); free(seen); free(uniq);
 }
 
@@ -1465,6 +1480,77 @@ static int sample_logits(const float *lo, int V) {
     }
     free(p);
     return V - 1;
+}
+
+/* f13: native C benchmark mode. Runs greedy decode and prints per-token
+ * decode timing to stderr, plus a JSON summary line at the end. This is the
+ * zero-overhead path — no Python subprocess, no JSON parsing. The Python
+ * bench_throughput.py harness calls this when available; otherwise it falls
+ * back to parsing stderr.
+ *
+ * Output format (stderr):
+ *   [bench] tok 0: decode_ms=195.3 rolling_tokps=5.12 hit=0/4
+ *   [bench] tok 1: decode_ms=188.7 rolling_tokps=5.30 hit=1/3
+ *   ...
+ *   [bench] SUMMARY {"tokens":20,"wall_s":78.98,"tokps":0.25,"warm_tokps":0.28,"hit_rate":0.554,"vnni":1,"moe_parallel":1}
+ */
+static int run_bench(Model *m, const int *prompt, int np, int max_new) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *x = falloc(D), *nrm = falloc(D), *tmp = falloc(D), *logits = falloc(c->vocab);
+    double t0 = now_s();
+    for (int i = 0; i < np; i++) {
+        embed_tok(m, prompt[i], x);
+        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, i, nrm, tmp);
+        if ((i + 1) == np || ((i + 1) % 32) == 0)
+            fprintf(stderr, "\r[bench-prefill] %d/%d", i + 1, np);
+    }
+    fprintf(stderr, "\n[bench-prefill] done in %.2fs\n", now_s() - t0);
+    rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+    matmul_qt(logits, nrm, &m->lm_head, 1);
+
+    int pos = np;
+    t0 = now_s();
+    double *step_times = (double *)malloc((size_t)max_new * sizeof(double));
+    int emitted = 0;
+    for (int t = 0; t < max_new; t++) {
+        double step_t0 = now_s();
+        int tok = sample_logits(logits, c->vocab);
+        printf("%d\n", tok);
+        fflush(stdout);
+        emitted++;
+        if (tok == c->eos) break;
+        embed_tok(m, tok, x);
+        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, pos, nrm, tmp);
+        pos++;
+        rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+        matmul_qt(logits, nrm, &m->lm_head, 1);
+        double step_dt = now_s() - step_t0;
+        step_times[t] = step_dt;
+        double rolling = (t + 1) / (now_s() - t0);
+        uint64_t tot = m->hits + m->miss;
+        fprintf(stderr, "[bench] tok %d: decode_ms=%.1f rolling_tokps=%.2f hit=%lu/%lu\n",
+                t, step_dt * 1000.0, rolling,
+                (unsigned long)m->hits, (unsigned long)(tot));
+    }
+    double dt = now_s() - t0;
+    double tokps = emitted / (dt > 1e-6 ? dt : 1e-6);
+    /* warm = last 50% of tokens */
+    int warm_start = emitted / 2;
+    double warm_sum = 0;
+    int warm_n = 0;
+    for (int t = warm_start; t < emitted; t++) { warm_sum += step_times[t]; warm_n++; }
+    double warm_tokps = warm_n > 0 ? warm_n / warm_sum : tokps;
+    double hit_rate = (m->hits + m->miss) > 0 ? (double)m->hits / (m->hits + m->miss) : 0;
+    fprintf(stderr, "[bench] SUMMARY {\"tokens\":%d,\"wall_s\":%.3f,\"tokps\":%.3f,\"warm_tokps\":%.3f,\"hit_rate\":%.4f,\"vnni\":%d,\"moe_parallel\":%d}\n",
+            emitted, dt, tokps, warm_tokps, hit_rate, g_use_vnni, g_moe_parallel);
+    fprintf(stderr, "[stat] %d tok in %.2fs (%.2f tok/s) | expert hit %.1f%% | warm %.2f tok/s\n",
+            emitted, dt, tokps, hit_rate * 100.0, warm_tokps);
+    /* f15: emit run_complete telemetry. */
+    telem_run_complete(emitted, dt, tokps, hit_rate, "colibri-m3");
+    free(step_times);
+    free(x); free(nrm); free(tmp); free(logits);
+    return 0;
 }
 
 static int run_gen(Model *m, const int *prompt, int np, int max_new) {
@@ -1766,6 +1852,10 @@ static int dry_run(const char *snap) {
 
 #ifndef TESTING
 int main(int argc, char **argv) {
+    /* Set sensible OMP defaults for --bench mode if not already in env. */
+    if (!getenv("OMP_PLACES"))    setenv("OMP_PLACES", "cores", 0);
+    if (!getenv("OMP_PROC_BIND")) setenv("OMP_PROC_BIND", "close", 0);
+
     const char *snap = getenv("SNAP");
     if (!snap) {
         fprintf(stderr, "usage: SNAP=<model_dir> ./m3 [cache] [ebits] [dbits] [ctx]\n");
@@ -1785,6 +1875,9 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--teacher-force")) {
         g_tf_mode = 1;
         argi = 2;
+    } else if (argc > 1 && !strcmp(argv[1], "--bench")) {
+        g_bench_mode = 1;
+        argi = 2;
     }
 
     int cap = argc > argi ? atoi(argv[argi]) : 128;
@@ -1800,22 +1893,21 @@ int main(int argc, char **argv) {
     if (getenv("TF_OUT")) g_tf_out_path = getenv("TF_OUT");
     if (getenv("M3_CHECK_NAN")) g_nan_check = atoi(getenv("M3_CHECK_NAN"));
     if (getenv("DEBUG_TRACE")) g_debug_trace = atoi(getenv("DEBUG_TRACE"));
+    if (getenv("BENCH_MODE")) g_bench_mode = atoi(getenv("BENCH_MODE"));
     /* f11: VNNI matmul kernels (USE_VNNI=1 enables AVX-512_VNNI path). */
     if (getenv("USE_VNNI")) g_use_vnni = atoi(getenv("USE_VNNI"));
     /* f12: parallel MoE expert dispatch (MOE_PARALLEL=1). */
     if (getenv("MOE_PARALLEL")) g_moe_parallel = atoi(getenv("MOE_PARALLEL"));
+    if (getenv("USE_AVX512_I4")) g_use_avx512_i4 = atoi(getenv("USE_AVX512_I4"));
     /* f10: NUMA topology discovery + optional thread pinning. */
+    numa_discover(&g_numa);
+    /* Parse env vars AFTER numa_discover (which sets defaults) so they override. */
     if (getenv("NUMA_INTERLEAVE")) {
         g_numa.interleave = atoi(getenv("NUMA_INTERLEAVE"));
-    } else {
-        g_numa.interleave = 1;   /* default: interleave model pages */
     }
     if (getenv("NUMA_PIN_THREADS")) {
         g_numa.pin_threads = atoi(getenv("NUMA_PIN_THREADS"));
-    } else {
-        g_numa.pin_threads = 1;   /* default: pin OMP threads to CPUs */
     }
-    numa_discover(&g_numa);
     fprintf(stderr, "[f10] NUMA: n_cpus=%d n_nodes=%d interleave=%d pin=%d\n",
             g_numa.n_cpus, g_numa.n_nodes, g_numa.interleave, g_numa.pin_threads);
     if (g_numa.interleave) {
@@ -1893,6 +1985,11 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    if (g_bench_mode) {
+        fprintf(stderr, "[bench] prompt=%d tokens, max_new=%d, vnni=%d, moe_parallel=%d\n",
+                np, max_new, g_use_vnni, g_moe_parallel);
+        return run_bench(&m, prompt, np, max_new);
+    }
     fprintf(stderr, "[run] prompt=%d tokens, max_new=%d\n", np, max_new);
     return run_gen(&m, prompt, np, max_new);
 }

@@ -19,7 +19,7 @@ C_TESTS = c/tests/test_msa \
           c/tests/test_int8_kv
 
 # Engine + headers shared by every C test.
-ENGINE_SRCS = src/engine.c src/st.h src/json.h src/planar_kv.h
+ENGINE_SRCS = src/engine.c src/st.h src/json.h src/planar_kv.h src/vnni.h src/numa.h src/observability.h
 
 .PHONY: all clean m3 test test-c test-tokenizer test-converter check
 

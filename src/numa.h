@@ -54,8 +54,8 @@ static inline int numa_discover(NumaTopo *t) {
     t->n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (t->n_cpus <= 0 || t->n_cpus > MAX_CPUS) t->n_cpus = 1;
     /* Default: assume interleave + pin both on (caller can disable via env). */
-    t->interleave = 1;
-    t->pin_threads = 1;
+    t->interleave = 0;  /* off by default (mbind often fails) */
+    t->pin_threads = 0;  /* off by default (causes 5x slowdown on memory-bound MoE) */
     /* Map cpu -> node by walking /sys/devices/system/cpu/cpuN/topology/physical_package_id.
      * Note: physical_package_id is the socket index, not the NUMA node index.
      * On Cascade Lake dual-socket these coincide (one node per socket). For
