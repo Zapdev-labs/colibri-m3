@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "json.h"
 
@@ -25,6 +26,9 @@ typedef struct {
     char *paths[512];
     int nfd;
     int *hidx, hcap;
+    /* mmap regions per shard file */
+    void *mmaps[512];      /* mmap base address (NULL = not mapped) */
+    size_t mmap_sizes[512]; /* size of each mmap region */
 } shards;
 
 static uint64_t st_hash(const char *s) {
@@ -57,7 +61,46 @@ static int st_open(shards *S, const char *path) {
     }
     S->fds[S->nfd] = fd;
     S->paths[S->nfd] = strdup(path);
+    S->mmaps[S->nfd] = NULL;
+    S->mmap_sizes[S->nfd] = 0;
     return S->fds[S->nfd++];
+}
+
+/* Forward declarations (defined below, but needed by st_mmap_ptr). */
+static int st_find(shards *S, const char *name);
+static int64_t st_nbytes(shards *S, const char *name);
+
+/* mmap a shard file for zero-copy access. Returns base pointer or NULL. */
+static void *st_mmap_file(shards *S, int fd_idx) {
+    if (fd_idx < 0 || fd_idx >= S->nfd) return NULL;
+    if (S->mmaps[fd_idx]) return S->mmaps[fd_idx];
+    /* Get file size */
+    off_t sz = lseek(S->fds[fd_idx], 0, SEEK_END);
+    if (sz < 0) return NULL;
+    void *base = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE | MAP_NORESERVE,
+                      S->fds[fd_idx], 0);
+    if (base == MAP_FAILED) return NULL;
+    S->mmaps[fd_idx] = base;
+    S->mmap_sizes[fd_idx] = (size_t)sz;
+    /* Advise sequential access for initial population, then let OS manage */
+    posix_fadvise(S->fds[fd_idx], 0, 0, POSIX_FADV_WILLNEED);
+    return base;
+}
+
+/* Get a pointer to a tensor's data via mmap (zero-copy). */
+static void *st_mmap_ptr(shards *S, const char *name) {
+    int i = st_find(S, name);
+    if (i < 0) return NULL;
+    st_tensor *t = &S->t[i];
+    /* Find which mmap this fd belongs to */
+    for (int f = 0; f < S->nfd; f++) {
+        if (S->fds[f] == t->fd) {
+            void *base = st_mmap_file(S, f);
+            if (!base) return NULL;
+            return (char *)base + t->off;
+        }
+    }
+    return NULL;
 }
 static void st_add(shards *S, const char *name, int fd, int64_t off, int64_t nb, int dt, int64_t n) {
     if (S->n >= S->cap) {

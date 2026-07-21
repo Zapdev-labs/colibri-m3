@@ -699,14 +699,29 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
             if (m->L[i].msa) m->Kidx[i] = falloc(idx_slot);
         }
     }
-    /* Prewarm: pull dense + shared expert weights into page cache by
-     * advising sequential access on all shard fds. The actual prewarm
-     * read happens for dense layers (small) and shared experts (medium).
-     * Routed experts are lazily loaded on demand (too large to prewarm all). */
-    for (int i = 0; i < m->S.nfd; i++) {
-#if defined(__linux__)
-        posix_fadvise(m->S.fds[i], 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
+    /* Prewarm: mmap all shard files and touch every page to pull the
+     * entire model into OS page cache. With 368GB RAM and 212GB model,
+     * everything fits. This eliminates page faults during inference. */
+    if (!getenv("SKIP_PREWARM")) {
+        double pw0 = now_s();
+        for (int f = 0; f < m->S.nfd; f++) {
+            void *base = st_mmap_file(&m->S, f);
+            if (!base) continue;
+            size_t sz = m->S.mmap_sizes[f];
+            /* Touch first byte of each 4KB page to trigger page-in */
+            volatile char *p = (volatile char *)base;
+            for (size_t off = 0; off < sz; off += 4096)
+                p[off];
+            /* Touch last page too */
+            if (sz > 0) p[sz - 1];
+        }
+        fprintf(stderr, "[prewarm] touched %.1f GB in %.1fs\n",
+                (double)m->S.mmap_sizes[0] / 1e9 * 0 /* dummy */, now_s() - pw0);
+        /* Calculate total mmaped */
+        size_t total = 0;
+        for (int f = 0; f < m->S.nfd; f++) total += m->S.mmap_sizes[f];
+        fprintf(stderr, "[prewarm] %.1f GB in page cache (%.1fs)\n",
+                (double)total / 1e9, now_s() - pw0);
     }
     fprintf(stderr, "[load] ready in %.1fs | expert cache %d/layer | kv_%s | msa_layers=%d\n",
             now_s() - t0, ecap,
@@ -739,14 +754,34 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
 
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     Cfg *c = &m->c;
-    char nm[3][320];
+    char nm[3][320], qs_nm[3][320];
     const char *suf[3] = {"gate_proj", "up_proj", "down_proj"};
-    for (int k = 0; k < 3; k++)
-        snprintf(nm[k], sizeof(nm[k]), "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, suf[k]);
+    int O[3] = {c->moe_inter, c->moe_inter, c->hidden};
+    int I[3] = {c->hidden, c->hidden, c->moe_inter};
+    QT *qt[3] = {&s->g, &s->u, &s->d};
     s->eid = eid;
-    qt_load(m, nm[0], c->moe_inter, c->hidden, m->ebits, &s->g);
-    qt_load(m, nm[1], c->moe_inter, c->hidden, m->ebits, &s->u);
-    qt_load(m, nm[2], c->hidden, c->moe_inter, m->ebits, &s->d);
+    for (int k = 0; k < 3; k++) {
+        snprintf(nm[k], sizeof(nm[k]), "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, suf[k]);
+        snprintf(qs_nm[k], sizeof(qs_nm[k]), "%s.qs", nm[k]);
+        int64_t nb = st_nbytes(&m->S, nm[k]);
+        QT *t = qt[k];
+        t->O = O[k]; t->I = I[k];
+        t->qf = NULL; t->q8 = NULL; t->q4 = NULL; t->s = NULL;
+        if (st_has(&m->S, qs_nm[k])) {
+            if (nb == (int64_t)O[k] * I[k]) {
+                t->fmt = 1;
+                t->q8 = (int8_t *)st_mmap_ptr(&m->S, nm[k]);
+                t->s = (float *)st_mmap_ptr(&m->S, qs_nm[k]);
+            } else {
+                t->fmt = 2;
+                t->q4 = (uint8_t *)st_mmap_ptr(&m->S, nm[k]);
+                t->s = (float *)st_mmap_ptr(&m->S, qs_nm[k]);
+            }
+        } else {
+            t->fmt = 0;
+            t->qf = (float *)st_mmap_ptr(&m->S, nm[k]);
+        }
+    }
     s->used = ++m->clock;
 }
 
@@ -769,18 +804,7 @@ static ESlot *expert_get(Model *m, int layer, int eid) {
         for (int z = 1; z < n; z++)
             if (Sl[z].used < Sl[lru].used) lru = z;
         dst = &Sl[lru];
-        free(dst->g.q8);
-        free(dst->g.q4);
-        free(dst->g.s);
-        free(dst->g.qf);
-        free(dst->u.q8);
-        free(dst->u.q4);
-        free(dst->u.s);
-        free(dst->u.qf);
-        free(dst->d.q8);
-        free(dst->d.q4);
-        free(dst->d.s);
-        free(dst->d.qf);
+        /* mmap'd experts: no free needed, data lives in mmap region */
         memset(dst, 0, sizeof(*dst));
     }
     expert_load(m, layer, eid, dst);
@@ -1296,34 +1320,60 @@ static void moe_parallel(Model *m, Layer *l, int layer, float *x, int S, float *
     free(logit); free(choice); free(idxs); free(ws); free(seen); free(uniq);
 }
 
+/* Persistent MoE scratch buffers — allocated once, reused across all layers.
+ * Eliminates 660+ malloc/free per token (11 per layer * 60 layers). */
+static float *g_moe_xg = NULL, *g_moe_gg = NULL, *g_moe_uu = NULL,
+             *g_moe_hh = NULL, *g_moe_sg = NULL, *g_moe_su = NULL;
+static int g_moe_scratch_D = 0, g_moe_scratch_I = 0;
+
+static void moe_scratch_init(int D, int I, int n_shared) {
+    int sI = I * n_shared;
+    if (D == g_moe_scratch_D && I == g_moe_scratch_I) return;
+    free(g_moe_xg); free(g_moe_gg); free(g_moe_uu);
+    free(g_moe_hh); free(g_moe_sg); free(g_moe_su);
+    g_moe_xg = falloc(D);     /* S=1 max for decode */
+    g_moe_gg = falloc(I);
+    g_moe_uu = falloc(I);
+    g_moe_hh = falloc(D);
+    g_moe_sg = falloc(sI);
+    g_moe_su = falloc(sI);
+    g_moe_scratch_D = D;
+    g_moe_scratch_I = I;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->experts, K = c->topk, I = c->moe_inter, sI = I * c->n_shared;
-    float *logit = falloc(E), *choice = falloc(E);
-    int *idxs = (int *)malloc((size_t)S * K * sizeof(int));
-    float *ws = (float *)malloc((size_t)S * K * sizeof(float));
+    moe_scratch_init(D, I, c->n_shared);
+    float *xg = g_moe_xg, *gg = g_moe_gg, *uu = g_moe_uu, *hh = g_moe_hh;
+    float *sg = g_moe_sg, *su = g_moe_su;
+    /* Small stack buffers for routing (avoid heap entirely) */
+    float logit_buf[256], choice_buf[256];
+    int idxs_buf[64], rows_buf[64];
+    float ws_buf[64];
+    int uniq_buf[256];
+    unsigned char seen_buf[256];
+    float *logit = logit_buf, *choice = choice_buf;
+    int *idxs = idxs_buf, *rows = rows_buf;
+    float *ws = ws_buf;
+    int *uniq = uniq_buf;
+    unsigned char *seen = seen_buf;
+    /* For large E or S, fall back to heap */
+    if (E > 256) { logit = falloc(E); choice = falloc(E); }
+    if (S * K > 64) { idxs = malloc(S*K*sizeof(int)); ws = malloc(S*K*sizeof(float)); }
+    memset(seen, 0, (size_t)E);
     memset(out, 0, (size_t)S * D * sizeof(float));
     for (int s = 0; s < S; s++) {
         moe_router(idxs + (int64_t)s * K, ws + (int64_t)s * K,
                    x + (int64_t)s * D, l->router, l->router_bias,
                    D, E, K, c->route_norm, c->router_scale, logit, choice);
     }
-    /* batch-union experts */
-    unsigned char *seen = (unsigned char *)calloc((size_t)E, 1);
-    int *uniq = (int *)malloc((size_t)E * sizeof(int));
     int nu = 0;
     for (int s = 0; s < S; s++)
         for (int kk = 0; kk < K; kk++) {
             int e = idxs[(int64_t)s * K + kk];
-            if (!seen[e]) {
-                seen[e] = 1;
-                uniq[nu++] = e;
-            }
+            if (!seen[e]) { seen[e] = 1; uniq[nu++] = e; }
         }
-    float *xg = falloc((int64_t)S * D), *gg = falloc((int64_t)S * I), *uu = falloc((int64_t)S * I),
-          *hh = falloc((int64_t)S * D);
-    int *rows = (int *)malloc((size_t)S * sizeof(int));
-    float *rw = (float *)malloc((size_t)S * sizeof(float));
     for (int j = 0; j < nu; j++) {
         int eid = uniq[j];
         ESlot *e = expert_get(m, layer, eid);
@@ -1332,9 +1382,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int kk = 0; kk < K; kk++)
                 if (idxs[(int64_t)s * K + kk] == eid) {
                     rows[nr] = s;
-                    rw[nr] = ws[(int64_t)s * K + kk];
-                    nr++;
-                    break;
+                    ws[nr] = ws[(int64_t)s * K + kk];
+                    nr++; break;
                 }
         for (int r = 0; r < nr; r++) memcpy(xg + (int64_t)r * D, x + (int64_t)rows[r] * D, (size_t)D * sizeof(float));
         matmul_qt(gg, xg, &e->g, nr);
@@ -1342,30 +1391,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int64_t z = 0; z < (int64_t)nr * I; z++) gg[z] = swiglu(gg[z], uu[z], c->sw_alpha, c->sw_limit);
         matmul_qt(hh, gg, &e->d, nr);
         for (int r = 0; r < nr; r++) {
-            float *os = out + (int64_t)rows[r] * D, w = rw[r], *hr = hh + (int64_t)r * D;
+            float *os = out + (int64_t)rows[r] * D, w = ws[r], *hr = hh + (int64_t)r * D;
             for (int d = 0; d < D; d++) os[d] += w * hr[d];
         }
     }
-    float *sg = falloc((int64_t)S * sI), *su = falloc((int64_t)S * sI);
     matmul_qt(sg, x, &l->sh_gate, S);
     matmul_qt(su, x, &l->sh_up, S);
     for (int64_t z = 0; z < (int64_t)S * sI; z++) sg[z] = swiglu(sg[z], su[z], c->sw_alpha, c->sw_limit);
     matmul_qt(hh, sg, &l->sh_down, S);
     for (int64_t z = 0; z < (int64_t)S * D; z++) out[z] += hh[z];
-    free(logit);
-    free(choice);
-    free(idxs);
-    free(ws);
-    free(seen);
-    free(uniq);
-    free(xg);
-    free(gg);
-    free(uu);
-    free(hh);
-    free(rows);
-    free(rw);
-    free(sg);
-    free(su);
+    if (E > 256) { free(logit); free(choice); }
+    if (S * K > 64) { free(idxs); free(ws); }
 }
 
 static void layer_fwd(Model *m, int li, float *x, int S, int pos0, float *nrm, float *tmp) {
@@ -1517,6 +1553,9 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
     fprintf(stderr, "\n[bench-prefill] done in %.2fs\n", now_s() - t0);
     rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
     matmul_qt(logits, nrm, &m->lm_head, 1);
+
+    /* bench mode: always greedy (TEMP=0) to isolate decode timing */
+    g_temp = 0.0f; g_topp = 0.0f; g_topk_samp = 0;
 
     int pos = np;
     t0 = now_s();
