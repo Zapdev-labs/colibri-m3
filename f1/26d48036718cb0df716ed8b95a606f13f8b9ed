@@ -1,0 +1,139 @@
+.gitignore
+  s_2591255b4df936::t_996ea28c349ca2 1-25
+LICENSE
+  s_2591255b4df936::t_11ba418ba3ec9f 1-17
+Makefile
+  s_2591255b4df936::t_3ae5457e3c52a5 1-128
+README.md
+  s_2591255b4df936::t_d76abd94e844cc 1-223
+RESEARCH.md
+  s_2591255b4df936::t_da1eeab6ec0a6c 1-1365
+c/tests/test_expert_slab_load.c
+  s_2591255b4df936::t_c8cb9a37992ed4 1-209
+c/tests/test_int8_kv.c
+  s_2591255b4df936::t_23ae32bca83ba5 1-90
+c/tests/test_kv_quant.c
+  s_2591255b4df936::t_32685e8899fee6 1-180
+c/tests/test_matmul_i4.c
+  s_2591255b4df936::t_222a48116d4d2a 1-217
+c/tests/test_moe_routing.c
+  s_2591255b4df936::t_609ddd32d088ed 1-306
+c/tests/test_msa.c
+  s_2591255b4df936::t_1afa71a0c58d0d 1-400
+c/tests/test_numa.c
+  s_2591255b4df936::t_6e2a09248cbece 1-48
+c/tests/test_per_head_qk_norm.c
+  s_2591255b4df936::t_1fadc4e7c86431 1-181
+c/tests/test_rmsnorm.c
+  s_2591255b4df936::t_15b99f956d51cb 1-129
+c/tests/test_rope.c
+  s_2591255b4df936::t_4938dd26d8604e 1-137
+c/tests/test_swiglu.c
+  s_2591255b4df936::t_c32027e3053ed7 1-198
+c/tests/test_tokenizer.py
+  s_2591255b4df936::t_1f21731df41a23 1-135
+c/tests/test_vnni.c
+  s_2591255b4df936::t_13bbf6a782ca71 1-220
+coli
+  s_2591255b4df936::t_5e8d26fa8e537d 1-425
+docs/llama-cpp-rq-observability.patch
+  s_2591255b4df936::t_6b6685cccf9e4e 1-88
+scripts/run-ai-server.sh
+  s_2591255b4df936::t_a0fdb83b98a935 1-9
+scripts/run-bench.sh
+  s_2591255b4df936::t_4af014ab128063 1-36
+scripts/run-cross-oracle.sh
+  s_2591255b4df936::t_48fbcd2dc008af 1-33
+scripts/run-numa.sh
+  s_2591255b4df936::t_21862e32c33e02 1-40
+src/engine.c
+  s_2591255b4df936::t_45093851e6b852 1-2082
+src/json.h
+  s_2591255b4df936::t_ebbd416cbf2384 1-150
+src/numa.h
+  s_2591255b4df936::t_b250259e19acff 1-138
+src/observability.h
+  s_2591255b4df936::t_47648d52ff3739 1-101
+src/planar_kv.h
+  s_2591255b4df936::t_3d6a4adfcde323 1-91
+src/st.h
+  s_2591255b4df936::t_1f2bdb64d528fc 1-227
+src/vnni.h
+  s_2591255b4df936::t_3aff0775e7d341 1-337
+tests/oracle/determinism_test_result.json
+  s_2591255b4df936::t_e9eb969cd8fbb4 1
+tests/oracle/eos_test_result.json
+  s_2591255b4df936::t_4d884a342218f3 1-11
+tests/oracle/greedy.json
+  s_2591255b4df936::t_762bd0bfd5daef 1-35
+tests/oracle/greedy_compare_result.json
+  s_2591255b4df936::t_d45f58ba8e9d4f 1-75
+tests/oracle/kv_cache_test_result.json
+  s_2591255b4df936::t_4723d64a5e4275 1-10
+tests/oracle/logits.json
+  s_2591255b4df936::t_fea41a9041a0c8 1
+tests/oracle/nan_test_result.json
+  s_2591255b4df936::t_37d0e6696d94d5 1-10
+tests/oracle/oracle_greedy.json
+  s_2591255b4df936::t_1e02e906896344 1-35
+tests/oracle/oracle_logits.json
+  s_2591255b4df936::t_e81ecfa22d28f5 1
+tests/oracle/tf_compare_result.json
+  s_2591255b4df936::t_0aeab68dccce38 1-10
+tests/oracle/throughput_result.json
+  s_2591255b4df936::t_b4d4ebbdefa6ce 1-55
+tools/bench_throughput.py
+  s_2591255b4df936::t_100aa8c81cc499 1-236
+tools/convert.py
+  s_2591255b4df936::t_1191f2864de231 1-424
+tools/cross_oracle_compare.py
+  s_2591255b4df936::t_8df6fa161429b4 1-338
+tools/llama_observability_wrapper.py
+  s_2591255b4df936::t_81e65b987f14c7 1-186
+tools/make_m3_oracle.py
+  s_2591255b4df936::t_bec29ac3217e5e 1-530
+tools/observability.py
+  s_2591255b4df936::t_a5732a4b569fd2 1-211
+tools/requant_attn.py
+  s_2591255b4df936::t_4b47e12fdd7f43 1-273
+tools/requant_attn_bf16.py
+  s_2591255b4df936::t_d77de6078cf108 1-241
+tools/requant_dense_bf16.py
+  s_2591255b4df936::t_318b93750d9a65 1-224
+tools/requant_io_f32.py
+  s_2591255b4df936::t_d94e0b9d163dd4 1-191
+tools/test_convert.py
+  s_2591255b4df936::t_424920ee175399 1-304
+tools/test_cross_oracle.py
+  s_2591255b4df936::t_e91b428bb2428c 1-95
+tools/test_determinism.py
+  s_2591255b4df936::t_a27003f94ae27f 1-157
+tools/test_eos.py
+  s_2591255b4df936::t_8793adc2700da0 1-154
+tools/test_kv_cache.py
+  s_2591255b4df936::t_bc51be8cae719b 1-155
+tools/test_numerical_stability.py
+  s_2591255b4df936::t_c7d0ab6d86cb5d 1-144
+tools/test_oracle_greedy.py
+  s_2591255b4df936::t_9d6b5db1d9acf5 1-142
+tools/test_oracle_logits.py
+  s_2591255b4df936::t_873320e8b294f5 1-294
+tools/test_throughput.py
+  s_2591255b4df936::t_786fb4e4fa3d2a 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "f126d48036718cb0df716ed8b95a606f13f8b9ed",
+  "prompts": {},
+  "sessions": {
+    "s_2591255b4df936": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "8d606e0a-594e-4793-bcb4-01d8820d40dd",
+        "model": "unknown"
+      },
+      "human_author": "Jackson57279 <otdoges@proton.me>"
+    }
+  }
+}
