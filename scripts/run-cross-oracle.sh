@@ -17,7 +17,7 @@ PROMPT="${PROMPT:-The quick brown fox jumps over the lazy dog}"
 NGEN="${NGEN:-20}"
 TF_TOKENS="${TF_TOKENS:-32}"
 
-export COLI_MODEL="${COLI_MODEL:-/home/ai/models/m3_i4_v3}"
+export COLI_MODEL="${COLI_MODEL:-/path/to/m3_i4}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-88}"
 export OMP_PLACES=cores
 export OMP_PROC_BIND=close

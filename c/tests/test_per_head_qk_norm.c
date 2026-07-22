@@ -141,7 +141,7 @@ static void test_per_head_qk_norm(void) {
      *     (per-tensor over head_dim, shared across heads) — matching HF and the
      *     engine's load path. The contract's [H, head_dim] claim was based on
      *     incorrect info; this asserts the actual checkpoint reality. Run with
-     *     `M3_CHECK_SHAPE=1 SNAP=/home/ai/models/m3_i4_v2` to enable. */
+     *     `M3_CHECK_SHAPE=1 SNAP=/path/to/m3_i4` to enable. */
     if (getenv("M3_CHECK_SHAPE") && getenv("M3_CHECK_SHAPE")[0] == '1') {
         const char *snap = getenv("SNAP");
         if (snap && st_has_path_prefix(snap)) {

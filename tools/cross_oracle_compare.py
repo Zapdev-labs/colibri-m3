@@ -40,9 +40,9 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
 RESULT_PATH = ROOT / "tests" / "oracle" / "cross_oracle_result.json"
 
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
-LLAMACPP_BIN = Path("/home/ai/llama.cpp-minimax-m3-rq/build-simd/bin/llama-server")
-GGUF_GLOB = "/home/ai/models/MiniMax-M3-MSA-GGUF/Q4_K_M/*.gguf"
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/path/to/m3_i4")
+LLAMACPP_BIN = Path("/path/to/llama.cpp-minimax-m3-rq/build-simd/bin/llama-server")
+GGUF_GLOB = "/path/to/MiniMax-M3-MSA-GGUF/Q4_K_M/*.gguf"
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = int(os.environ.get("CROSS_PORT", "8399"))
 
@@ -214,7 +214,7 @@ def start_server(port: int, threads: int) -> subprocess.Popen:
            "--no-warmup", "--temp", "0", "--top-k", "1",
            "--top-p", "1.0", "--repeat-penalty", "1.0"]
     env = os.environ.copy()
-    ld = f"/home/ai/llama.cpp-minimax-m3-rq/build-simd/bin:{env.get('LD_LIBRARY_PATH','')}"
+    ld = f"/path/to/llama.cpp-minimax-m3-rq/build-simd/bin:{env.get('LD_LIBRARY_PATH','')}"
     env["LD_LIBRARY_PATH"] = ld
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, preexec_fn=os.setsid)

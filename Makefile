@@ -46,8 +46,8 @@ test-c: $(C_TESTS)
 test-tokenizer:
 	@echo "==> running tokenizer round-trip tests"
 	@# Prefer a venv that has the tokenizers lib; fall back to system python3.
-	@if [ -x /home/ai/llama-convert-venv/bin/python ]; then \
-		PY=/home/ai/llama-convert-venv/bin/python; \
+	@if [ -x python3 ]; then \
+		PY=python3; \
 	else \
 		PY=python3; \
 	fi; \

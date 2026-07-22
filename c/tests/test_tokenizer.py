@@ -2,7 +2,7 @@
 """test_tokenizer.py — VAL-CORR-022: tokenizer encode/decode round-trip is identity.
 
 Verifies the colibri-m3 tokenizer (HF `tokenizers` lib reading
-$SNAP/tokenizer.json, defaulting to /home/ai/models/m3_i4_v2/tokenizer.json)
+$SNAP/tokenizer.json, defaulting to /path/to/m3_i4/tokenizer.json)
 round-trips a corpus of test strings without loss: decode(encode(s)) == s.
 
 Test corpus includes:
@@ -13,7 +13,7 @@ Test corpus includes:
   (e) an empty string
 
 Run: python3 c/tests/test_tokenizer.py
-     (or: SNAP=/home/ai/models/m3_i4_v2 python3 c/tests/test_tokenizer.py)
+     (or: SNAP=/path/to/m3_i4 python3 c/tests/test_tokenizer.py)
 """
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ import sys
 # then the m3-target-meta path (tokenizer source-of-truth).
 CANDIDATES = [
     os.environ.get("SNAP"),
-    "/home/ai/models/m3_i4_v2",
-    "/home/ai/models/m3-target-meta",
+    "/path/to/m3_i4",
+    "/path/to/m3-target-meta",
 ]
 TOK_PATH = None
 for c in CANDIDATES:
@@ -34,7 +34,7 @@ for c in CANDIDATES:
         break
 
 if TOK_PATH is None:
-    print("SKIP: tokenizer.json not found (set SNAP=/home/ai/models/m3_i4_v2)")
+    print("SKIP: tokenizer.json not found (set SNAP=/path/to/m3_i4)")
     sys.exit(0)  # skip is not a failure for `make test` on a clean checkout
 
 try:

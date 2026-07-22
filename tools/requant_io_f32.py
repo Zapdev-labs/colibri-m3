@@ -13,12 +13,12 @@ lm_head is the FINAL projection producing logits. Upgrading it from int8
 directly reducing greedy-decode token flips at sensitive positions.
 
 Usage:
-  python3 tools/requant_io_f32.py --snap /home/ai/models/m3_i4_v3 \
+  python3 tools/requant_io_f32.py --snap /path/to/m3_i4 \
                                   --repo MiniMaxAI/MiniMax-M3
 
 Environment:
   Requires safetensors + numpy + huggingface_hub + torch.
-  Use /home/ai/llama-convert-venv/bin/python.
+  Use python3.
 """
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def main() -> int:
         description="Upgrade embed_tokens + lm_head from int8 to f32 (f17)",
     )
     ap.add_argument("--snap", required=True,
-                    help="snapshot dir to update (e.g. /home/ai/models/m3_i4_v3)")
+                    help="snapshot dir to update (e.g. /path/to/m3_i4)")
     ap.add_argument("--repo", default=REPO, help="HF repo for BF16 source")
     a = ap.parse_args()
 

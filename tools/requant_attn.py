@@ -19,11 +19,11 @@ the int8 attention tensors are loaded via the existing ``matmul_i8`` path
 (the same path used for embed_tokens/lm_head).
 
 Usage:
-  python3 tools/requant_attn.py --src /home/ai/models/m3_i4_v2 \
-                               --dst /home/ai/models/m3_i4_v3
+  python3 tools/requant_attn.py --src /path/to/m3_i4 \
+                               --dst /path/to/m3_i4
 
 Environment:
-  Requires safetensors + numpy (e.g. /home/ai/llama-convert-venv/bin/python).
+  Requires safetensors + numpy (e.g. python3).
   Does NOT require torch (uses safetensors numpy framework).
 """
 from __future__ import annotations
@@ -201,8 +201,8 @@ def main() -> int:
         description="Re-quantize attention projections from int4 to int8 (f17)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--src", required=True, help="source snapshot dir (e.g. /home/ai/models/m3_i4_v2)")
-    ap.add_argument("--dst", required=True, help="destination snapshot dir (e.g. /home/ai/models/m3_i4_v3)")
+    ap.add_argument("--src", required=True, help="source snapshot dir (e.g. /path/to/m3_i4)")
+    ap.add_argument("--dst", required=True, help="destination snapshot dir (e.g. /path/to/m3_i4)")
     ap.add_argument("--max-shards", type=int, default=None,
                     help="process only N shards (smoke mode for testing)")
     a = ap.parse_args()

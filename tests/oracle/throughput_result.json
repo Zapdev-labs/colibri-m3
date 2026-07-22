@@ -1,0 +1,55 @@
+{
+  "prompt": "Once upon a time there lived a humble programmer named Alice who",
+  "prompt_ids": [
+    758,
+    4729,
+    15801,
+    62222
+  ],
+  "model": "/path/to/m3_i4",
+  "threads": 88,
+  "ngen_requested": 20,
+  "ngen_emitted": 20,
+  "prefill_s": 3.18,
+  "wall_s": 17.83,
+  "tokps_overall": 1.12,
+  "tokps_warm": 1.2320000000000002,
+  "hit_rate": 0.5539999999999999,
+  "target_tokps": 5.0,
+  "target_hit_rate": 0.95,
+  "target_rss_gb": 350,
+  "meets_throughput_target": false,
+  "meets_hit_rate_target": false,
+  "use_vnni": false,
+  "numa_interleave": true,
+  "numa_before": {
+    "error": "no row matching colibri"
+  },
+  "numa_after": {
+    "error": "no row matching colibri"
+  },
+  "baseline_llamacpp_tokps": 7.7,
+  "token_ids": [
+    58841,
+    1049,
+    275,
+    34810,
+    6787,
+    46,
+    32,
+    10010,
+    26551,
+    39490,
+    48,
+    1866,
+    43,
+    424,
+    6426,
+    43,
+    424,
+    1973,
+    1456,
+    409
+  ],
+  "meets_overall": false
+}

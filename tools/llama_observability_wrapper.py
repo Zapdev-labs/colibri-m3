@@ -32,7 +32,7 @@ import threading
 import time
 from pathlib import Path
 
-LLAMACPP_BIN_DEFAULT = "/home/ai/llama.cpp-minimax-m3-rq/build-simd/bin/llama-server"
+LLAMACPP_BIN_DEFAULT = "/path/to/llama.cpp-minimax-m3-rq/build-simd/bin/llama-server"
 DEFAULT_TELEMETRY = "/tmp/llama_telem.jsonl"
 
 # Patterns from the rq fork's msa-runtime.cpp stderr (see RESEARCH.md §7.2).
@@ -139,7 +139,7 @@ def main() -> int:
         cmd = ["numactl", "--interleave=all"] + cmd
 
     env = os.environ.copy()
-    ld = f"/home/ai/llama.cpp-minimax-m3-rq/build-simd/bin:{env.get('LD_LIBRARY_PATH','')}"
+    ld = f"/path/to/llama.cpp-minimax-m3-rq/build-simd/bin:{env.get('LD_LIBRARY_PATH','')}"
     env["LD_LIBRARY_PATH"] = ld
 
     Path(args.telemetry).parent.mkdir(parents=True, exist_ok=True)

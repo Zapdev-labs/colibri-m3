@@ -18,12 +18,12 @@
  * This test requires the v2 snapshot at $SNAP. If SNAP is unset, the test
  * prints a SKIP notice and exits 0 (so `make test` still passes on a clean
  * checkout without the 199GB model). Run with:
- *   SNAP=/home/ai/models/m3_i4_v2 ./c/tests/test_expert_slab_load
+ *   SNAP=/path/to/m3_i4 ./c/tests/test_expert_slab_load
  *
  * Build: gcc -DTESTING -O3 -march=native -fopenmp -Wall -Wextra \
  *          -Wno-unused-function -Isrc c/tests/test_expert_slab_load.c \
  *          -o c/tests/test_expert_slab_load -lm
- * Run:   SNAP=/home/ai/models/m3_i4_v2 ./c/tests/test_expert_slab_load
+ * Run:   SNAP=/path/to/m3_i4 ./c/tests/test_expert_slab_load
  */
 #ifndef TESTING
 #define TESTING
@@ -139,7 +139,7 @@ static void test_expert_slab_load(void) {
     fprintf(stderr, "==> test_expert_slab_load bit-exact vs safetensors\n");
     const char *snap = getenv("SNAP");
     if (!snap || strlen(snap) == 0) {
-        fprintf(stderr, "   SKIP: SNAP env not set — run with SNAP=/home/ai/models/m3_i4_v2 to enable\n");
+        fprintf(stderr, "   SKIP: SNAP env not set — run with SNAP=/path/to/m3_i4 to enable\n");
         g_skip = 1;
         return;
     }

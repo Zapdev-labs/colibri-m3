@@ -17,7 +17,7 @@ Outputs JSON to tests/oracle/throughput_result.json.
 
 Usage:
   python3 tools/bench_throughput.py --prompt 'Once upon a time' \
-      --ngen 200 --model /home/ai/models/m3_i4_v3 --threads 88
+      --ngen 200 --model /path/to/m3_i4 --threads 88
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
 RESULT_PATH = ROOT / "tests" / "oracle" / "throughput_result.json"
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/path/to/m3_i4")
 
 TARGET_TOKPS = 5.0   # f13 contract: >=5 tok/s sustained decode
 WARMUP_FRAC = 0.5     # last 50% of tokens are 'warm cache'

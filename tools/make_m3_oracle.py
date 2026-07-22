@@ -18,7 +18,7 @@ Two backends are supported:
                    ~852 GB on disk and enough RAM to materialise the active
                    layer's tensors (low_cpu_mem_usage + mmap streaming).
   - ``llamacpp`` : llama.cpp fork ``llama-server`` driving the 247 GB Q4_K_M GGUF
-                   at ``/home/ai/models/MiniMax-M3-MSA-GGUF/Q4_K_M/``.  Fits in
+                   at ``/path/to/MiniMax-M3-MSA-GGUF/Q4_K_M/``.  Fits in
                    the 376 GB remote.  Used as the secondary oracle when BF16 is
                    unavailable (the documented fallback path).
 
@@ -62,15 +62,15 @@ DEFAULT_NGEN = 20            # greedy decode length
 DEFAULT_TF_TOKENS = 32      # teacher-forcing length (>= ngen so greedy ⊂ tf)
 
 # llama.cpp fork paths (READ-ONLY oracle -- never modified)
-LLAMACPP_ROOT = Path("/home/ai/llama.cpp-minimax-m3-rq")
+LLAMACPP_ROOT = Path("/path/to/llama.cpp-minimax-m3-rq")
 LLAMACPP_BIN = LLAMACPP_ROOT / "build-simd" / "bin" / "llama-server"
-GGUF_GLOB = "/home/ai/models/MiniMax-M3-MSA-GGUF/Q4_K_M/*.gguf"
+GGUF_GLOB = "/path/to/MiniMax-M3-MSA-GGUF/Q4_K_M/*.gguf"
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8399           # out-of-the-way of 3119 (mission HTTP stretch) and 8080 (llama default)
 
 # HF paths
-HF_META_DIR = "/home/ai/models/m3-target-meta"   # config + tokenizer + auto_map
-HFENV_PYTHON = "/home/ai/hfenv/bin/python"         # transformers 5.12.1 + torch 2.12.1+cpu
+HF_META_DIR = "/path/to/m3-target-meta"   # config + tokenizer + auto_map
+HFENV_PYTHON = "python3"         # transformers 5.12.1 + torch 2.12.1+cpu
 
 VOCAB_SIZE = 200064          # from config.text_config.vocab_size
 

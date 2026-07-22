@@ -1,7 +1,7 @@
 # llama.cpp-minimax-m3-rq observability patch (f15)
 
 This is a **read-only patch** against the `llama.cpp-minimax-m3-rq` fork at
-`/home/ai/llama.cpp-minimax-m3-rq/` (branch `MSA`, HEAD `cacc42f7`). The fork
+`/path/to/llama.cpp-minimax-m3-rq/` (branch `MSA`, HEAD `cacc42f7`). The fork
 is treated as read-only for this mission; the patch is provided so users who
 want native `--m3-telemetry-path` emission (matching colibri-m3's
 `src/observability.h` schema) can apply it locally.
@@ -64,12 +64,12 @@ schema as colibri-m3:
 The decode loop in `server.cpp`'s `process_token` would call `telem_emit`
 with a `decode_step` event per token, and the run-completion path would emit
 `run_complete`. The exact line numbers depend on the fork's HEAD; apply with
-`patch -p1` after `cd /home/ai/llama.cpp-minimax-m3-rq`.
+`patch -p1` after `cd /path/to/llama.cpp-minimax-m3-rq`.
 
 ## Applying the patch
 
 ```bash
-cd /home/ai/llama.cpp-minimax-m3-rq
+cd /path/to/llama.cpp-minimax-m3-rq
 # Create a fresh fork-of-fork to keep the original read-only:
 git clone --shared . /home/ai/colibri-m3-llama-obs
 cd /home/ai/colibri-m3-llama-obs

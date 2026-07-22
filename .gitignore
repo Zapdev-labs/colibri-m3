@@ -17,3 +17,9 @@ c/tests/test_moe_routing
 c/tests/test_per_head_qk_norm
 c/tests/test_kv_quant
 c/tests/test_expert_slab_load
+c/tests/test_vnni
+c/tests/test_numa
+c/tests/test_int8_kv
+c/tests/test_vnni
+c/tests/test_numa
+c/tests/test_int8_kv

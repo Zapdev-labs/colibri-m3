@@ -12,12 +12,12 @@ these from BF16 at int8 (255 levels vs int4's 15) should further improve oracle
 match rate beyond the attention int8 fix.
 
 Usage:
-  python3 tools/requant_dense_bf16.py --snap /home/ai/models/m3_i4_v3 \
+  python3 tools/requant_dense_bf16.py --snap /path/to/m3_i4 \
                                       --repo MiniMaxAI/MiniMax-M3
 
 Environment:
   Requires safetensors + numpy + huggingface_hub + torch.
-  Use /home/ai/llama-convert-venv/bin/python.
+  Use python3.
 """
 from __future__ import annotations
 
@@ -156,7 +156,7 @@ def main() -> int:
         description="Re-quantize shared experts + dense MLP from BF16 (f17 fallback)",
     )
     ap.add_argument("--snap", required=True,
-                    help="snapshot dir to update (e.g. /home/ai/models/m3_i4_v3)")
+                    help="snapshot dir to update (e.g. /path/to/m3_i4)")
     ap.add_argument("--repo", default=REPO, help="HF repo for BF16 source")
     ap.add_argument("--max-shards", type=int, default=None,
                     help="process only N HF shards (smoke mode)")

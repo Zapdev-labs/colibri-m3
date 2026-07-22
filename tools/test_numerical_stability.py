@@ -13,7 +13,7 @@ This catches the common MSA-port failure (block scores underflowing softmax
 -> NaN) and the common MoE failure (router bias overflow -> Inf).
 
 Usage:
-  python3 tools/test_numerical_stability.py [--model /home/ai/models/m3_i4_v3]
+  python3 tools/test_numerical_stability.py [--model /path/to/m3_i4]
                                             [--ngen 50]
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGIN = ROOT / "m3"
-DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/home/ai/models/m3_i4_v3")
+DEFAULT_MODEL = os.environ.get("COLI_MODEL", "/path/to/m3_i4")
 
 
 def log(msg: str) -> None:
