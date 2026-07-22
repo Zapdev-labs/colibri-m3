@@ -1,0 +1,10 @@
+{
+  "passed": false,
+  "summary": "FAIL: argmax 29/32 (floor 30, target 32) | overlap >= 90% at 3/32 positions (9.4%, floor 90%) | max_lp_diff=4.28 at pos 8 (tol 0.01) | worst_overlap=0.645 at pos 8",
+  "n_positions": 32,
+  "argmax_floor": 30,
+  "argmax_target": 32,
+  "overlap_floor": 0.9,
+  "logprob_tol": 0.01,
+  "backend": "llamacpp"
+}

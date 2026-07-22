@@ -1,0 +1,88 @@
+# llama.cpp-minimax-m3-rq observability patch (f15)
+
+This is a **read-only patch** against the `llama.cpp-minimax-m3-rq` fork at
+`/path/to/llama.cpp-minimax-m3-rq/` (branch `MSA`, HEAD `cacc42f7`). The fork
+is treated as read-only for this mission; the patch is provided so users who
+want native `--m3-telemetry-path` emission (matching colibri-m3's
+`src/observability.h` schema) can apply it locally.
+
+Without this patch, the cross-engine observability harness works via
+`tools/llama_observability_wrapper.py`, which parses the fork's existing
+stderr MSA telemetry (schema v3, emitted by `src/models/msa-runtime.cpp`)
+and translates it into the colibri-m3 JSON-line schema. The wrapper is
+sufficient for side-by-side dashboards; the native patch is for users who
+want lower-overhead in-process emission.
+
+## What the patch adds
+
+A new `--m3-telemetry-path PATH` CLI flag in `common/arg.cpp` and
+`common/common.h`, plumbed through `llama-server`'s main loop. When set, the
+server emits one JSON-line event per decode step to PATH, using the same
+schema as colibri-m3:
+
+```json
+{"ts": 12.345, "event": "decode_step", "pos": 42, "step_ms": 128.5, "hit": 1, "miss": 0, "tokps": 7.78}
+{"ts": 12.456, "event": "run_complete", "tokens": 200, "wall_s": 38.5, "tokps": 5.19, "hit_rate": 0.962, "engine": "llama.cpp-minimax-m3-rq"}
+```
+
+## Patch (unified diff)
+
+```diff
+--- a/common/common.h
++++ b/common/common.h
+@@ -180,6 +180,9 @@ struct common_params {
+     // f15: optional path for cross-engine telemetry emission (matches
+     // colibri-m3's src/observability.h schema). Empty = disabled.
+     std::string m3_telemetry_path;
++#endif
+
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -950,6 +950,10 @@ common_params_context_arg_parser(common_params_params & params) {
+     ctx_opt.add_entry({"--m3-telemetry-path", "PATH"},
+         "f15: emit per-step JSON-line telemetry to PATH (matches colibri-m3 schema)",
+         [](common_params & params, const std::string & value) {
+             params.m3_telemetry_path = value;
+         });
+
+--- a/examples/server/server.cpp
++++ b/examples/server/server.cpp
+@@ -120,6 +120,7 @@ static FILE * g_telem_fp = nullptr;
+ static void telem_init(const std::string & path) {
+     if (path.empty()) return;
+     g_telem_fp = fopen(path.c_str(), "w");
+     if (g_telem_fp) fprintf(stderr, "[f15] telemetry -> %s\n", path.c_str());
+ }
+ static void telem_emit(const std::string & event, const std::string & kv) {
+     if (!g_telem_fp) return;
+     fprintf(g_telem_fp, "{\"ts\": %.6f, \"event\": \"%s\", %s}\n",
+             ggml_time_ms() / 1000.0, event.c_str(), kv.c_str());
+     fflush(g_telem_fp);
+ }
+```
+
+The decode loop in `server.cpp`'s `process_token` would call `telem_emit`
+with a `decode_step` event per token, and the run-completion path would emit
+`run_complete`. The exact line numbers depend on the fork's HEAD; apply with
+`patch -p1` after `cd /path/to/llama.cpp-minimax-m3-rq`.
+
+## Applying the patch
+
+```bash
+cd /path/to/llama.cpp-minimax-m3-rq
+# Create a fresh fork-of-fork to keep the original read-only:
+git clone --shared . /home/ai/colibri-m3-llama-obs
+cd /home/ai/colibri-m3-llama-obs
+patch -p1 < /home/ai/colibri-m3/docs/llama-cpp-rq-observability.patch
+cmake -B build-simd -DGGML_NATIVE=ON -DGGML_AVX512=ON
+cmake --build build-simd --target llama-server -j
+```
+
+## Why a patch, not an applied fork
+
+Per `RESEARCH.md §7.2`, the `llama.cpp-minimax-m3-rq` fork is the
+**read-only correctness oracle** for the colibri-m3 mission. Modifying it
+in place would compromise its role as an independent oracle. The wrapper
+approach (`tools/llama_observability_wrapper.py`) extracts the same
+telemetry from stderr without modifying the fork, so the cross-engine
+dashboard works today without applying this patch.

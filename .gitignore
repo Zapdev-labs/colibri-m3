@@ -1,0 +1,25 @@
+m3
+*.o
+__pycache__/
+*.pyc
+.m3_i4/
+m3_i4/
+.env
+.DS_Store
+
+# C unit-test binaries (compiled by make test-c)
+c/tests/test_msa
+c/tests/test_matmul_i4
+c/tests/test_rope
+c/tests/test_rmsnorm
+c/tests/test_swiglu
+c/tests/test_moe_routing
+c/tests/test_per_head_qk_norm
+c/tests/test_kv_quant
+c/tests/test_expert_slab_load
+c/tests/test_vnni
+c/tests/test_numa
+c/tests/test_int8_kv
+c/tests/test_vnni
+c/tests/test_numa
+c/tests/test_int8_kv

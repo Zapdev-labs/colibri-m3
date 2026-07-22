@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "tokens_emitted": 20,
+  "nan_check_ok": 7521,
+  "nan_check_failed": 0,
+  "trace_lines": 0,
+  "debug_trace": false,
+  "engine_rc": 0,
+  "first_failures": []
+}
