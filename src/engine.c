@@ -1599,7 +1599,10 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
                     memcpy(e3_h2, x, (size_t)D * sizeof(float)); e3_captured++;
                     if (e3_captured == 3) {
                         float *e3_logits = falloc(c->vocab);
-                        e3_forward(e3_h0, e3_h1, e3_h2, prompt[i], i, e3_logits, c, m);
+                        int next_tok = (i + 1 < np) ? prompt[i + 1] : -1;
+                        int e3_pred = e3_forward(e3_h0, e3_h1, e3_h2, next_tok >= 0 ? next_tok : prompt[i], i, e3_logits, c, m);
+                        int expected = (i + 2 < np) ? prompt[i + 2] : -1;
+                        fprintf(stderr, "[e3prefill] pos=%d pred=%d next=%d expected(i+2)=%d match=%d\n", i, e3_pred, next_tok, expected, e3_pred == expected);
                         free(e3_logits);
                     }
                 }
@@ -1672,7 +1675,8 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
         int draft_tok = -1;
         if (g_use_mtp && g_e3.loaded && e3_has_hidden) {
             float *draft_logits = falloc(c->vocab);
-            draft_tok = e3_forward(e3_h0, e3_h1, e3_h2, tok, pos - 1, draft_logits, c, m);
+            int base_tok = sample_logits(logits, c->vocab);
+            draft_tok = e3_forward(e3_h0, e3_h1, e3_h2, base_tok, pos - 1, draft_logits, c, m);
             free(draft_logits);
         }
 
