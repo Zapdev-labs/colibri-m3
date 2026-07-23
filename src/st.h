@@ -84,6 +84,14 @@ static void *st_mmap_file(shards *S, int fd_idx) {
     S->mmap_sizes[fd_idx] = (size_t)sz;
     /* Advise sequential access for initial population, then let OS manage */
     posix_fadvise(S->fds[fd_idx], 0, 0, POSIX_FADV_WILLNEED);
+    /* Interleave pages across NUMA nodes for balanced memory bandwidth */
+#if defined(__linux__) && defined(__NR_mbind)
+    {
+        unsigned long nodemask = 3;  /* nodes 0 and 1 */
+        syscall(__NR_mbind, base, (size_t)sz, 1 /* MPOL_INTERLEAVE */,
+               &nodemask, 64, 0);
+    }
+#endif
     return base;
 }
 
