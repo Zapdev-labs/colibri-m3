@@ -42,6 +42,12 @@
 #define COLIBRI_M3_VNNI_H
 
 #include <immintrin.h>
+
+#if defined(__AVX512F__)
+static inline float hsum512(__m512 v) {
+    return _mm512_reduce_add_ps(v);
+}
+#endif
 #include <stdint.h>
 #include <string.h>
 
@@ -264,53 +270,74 @@ static void matmul_i4_avx512(float *y, const float *x, const uint8_t *q4,
         float scale = sc[o];
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
-            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+            __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
             int i = 0;
-            /* Process 32 nibbles (16 packed bytes) per iteration.
-             * Uses _mm256_cvtepi8_epi32 (signed) which works correctly on GCC 13.3,
-             * unlike _mm256_cvtepu8_epi32 (unsigned) which is broken. */
+            /* Process 64 nibbles (32 packed bytes) per iteration using 512-bit FMA */
+            for (; i + 64 <= I; i += 64) {
+                __m256i packed = _mm256_loadu_si256((const __m256i *)(w + (i >> 1)));
+                /* Unpack low 16 bytes (32 nibbles) */
+                __m128i p16a = _mm256_castsi256_si128(packed);
+                __m128i lo_a = _mm_and_si128(p16a, mask);
+                __m128i hi_a = _mm_and_si128(_mm_srli_epi16(p16a, 4), mask);
+                lo_a = _mm_sub_epi8(lo_a, sub8);
+                hi_a = _mm_sub_epi8(hi_a, sub8);
+                __m128i inter_a = _mm_unpacklo_epi8(lo_a, hi_a);
+                __m128i inter_b = _mm_unpackhi_epi8(lo_a, hi_a);
+                /* 16 int8 -> 16 int32 -> 16 f32 -> FMA with 16 floats */
+                __m512i i32a = _mm512_cvtepi8_epi32(inter_a);
+                __m512i i32b = _mm512_cvtepi8_epi32(inter_b);
+                acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32a),
+                                       _mm512_loadu_ps(xs + i), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32b),
+                                       _mm512_loadu_ps(xs + i + 16), acc1);
+                /* Unpack high 16 bytes (32 nibbles) */
+                __m128i p16b = _mm256_extracti128_si256(packed, 1);
+                __m128i lo_b = _mm_and_si128(p16b, mask);
+                __m128i hi_b = _mm_and_si128(_mm_srli_epi16(p16b, 4), mask);
+                lo_b = _mm_sub_epi8(lo_b, sub8);
+                hi_b = _mm_sub_epi8(hi_b, sub8);
+                __m128i inter_c = _mm_unpacklo_epi8(lo_b, hi_b);
+                __m128i inter_d = _mm_unpackhi_epi8(lo_b, hi_b);
+                __m512i i32c = _mm512_cvtepi8_epi32(inter_c);
+                __m512i i32d = _mm512_cvtepi8_epi32(inter_d);
+                acc2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32c),
+                                       _mm512_loadu_ps(xs + i + 32), acc2);
+                acc3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32d),
+                                       _mm512_loadu_ps(xs + i + 48), acc3);
+            }
+            /* 32-nibble remainder */
             for (; i + 32 <= I; i += 32) {
                 __m128i packed = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
                 __m128i lo = _mm_and_si128(packed, mask);
                 __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
-                /* Subtract 8 to get signed values [-8, 7] before signed conversion */
                 lo = _mm_sub_epi8(lo, sub8);
                 hi = _mm_sub_epi8(hi, sub8);
-                __m128i interlo = _mm_unpacklo_epi8(lo, hi);   /* 16 signed int8 */
-                __m128i interhi = _mm_unpackhi_epi8(lo, hi);   /* 16 signed int8 */
-                /* Lower 8 bytes -> 8 int32 -> 8 f32 -> FMA */
-                __m256i i32a = _mm256_cvtepi8_epi32(interlo);
-                __m256i i32b = _mm256_cvtepi8_epi32(_mm_srli_si128(interlo, 8));
-                __m256i i32c = _mm256_cvtepi8_epi32(interhi);
-                __m256i i32d = _mm256_cvtepi8_epi32(_mm_srli_si128(interhi, 8));
-                acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32a),
-                                       _mm256_loadu_ps(xs + i), acc0);
-                acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32b),
-                                       _mm256_loadu_ps(xs + i + 8), acc0);
-                acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32c),
-                                       _mm256_loadu_ps(xs + i + 16), acc1);
-                acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32d),
-                                       _mm256_loadu_ps(xs + i + 24), acc1);
+                __m128i inter_a = _mm_unpacklo_epi8(lo, hi);
+                __m128i inter_b = _mm_unpackhi_epi8(lo, hi);
+                __m512i i32a = _mm512_cvtepi8_epi32(inter_a);
+                __m512i i32b = _mm512_cvtepi8_epi32(inter_b);
+                acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32a),
+                                       _mm512_loadu_ps(xs + i), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32b),
+                                       _mm512_loadu_ps(xs + i + 16), acc1);
             }
-            /* 16-nibble remainder chunks (8 packed bytes) */
+            /* 16-nibble remainder */
             for (; i + 16 <= I; i += 16) {
                 __m128i packed = _mm_loadl_epi64((const __m128i *)(w + (i >> 1)));
                 __m128i lo = _mm_and_si128(packed, mask);
                 __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
                 lo = _mm_sub_epi8(lo, sub8);
                 hi = _mm_sub_epi8(hi, sub8);
-                __m128i interlo = _mm_unpacklo_epi8(lo, hi);
-                /* Lower 8 bytes = nibbles 0-7 */
-                __m256i i32a = _mm256_cvtepi8_epi32(interlo);
-                /* Upper 8 bytes = nibbles 8-15 */
-                __m256i i32b = _mm256_cvtepi8_epi32(_mm_srli_si128(interlo, 8));
-                acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32a),
-                                       _mm256_loadu_ps(xs + i), acc0);
-                acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32b),
-                                       _mm256_loadu_ps(xs + i + 8), acc0);
+                __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                __m512i i32a = _mm512_cvtepi8_epi32(inter);
+                acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32a),
+                                       _mm512_loadu_ps(xs + i), acc0);
             }
-            __m256 acc = _mm256_add_ps(acc0, acc1);
-            float sum = hsum256_ps(acc);
+            __m512 acc01 = _mm512_add_ps(acc0, acc1);
+            __m512 acc23 = _mm512_add_ps(acc2, acc3);
+            __m512 acc = _mm512_add_ps(acc01, acc23);
+            float sum = hsum512(acc);
             for (; i < I; i++) {
                 uint8_t b = w[i >> 1];
                 int wv = (i & 1) ? (b >> 4) - 8 : (b & 0xF) - 8;

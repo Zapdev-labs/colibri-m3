@@ -126,9 +126,7 @@ static float *falloc(int64_t n) {
 }
 
 #ifdef __AVX512F__
-static inline float hsum512(__m512 v) {
-    return _mm512_reduce_add_ps(v);
-}
+/* hsum512 is now defined in vnni.h */
 static inline float dot_f(const float *a, const float *b, int n) {
     __m512 acc = _mm512_setzero_ps();
     int i = 0;
