@@ -44,7 +44,8 @@ typedef struct {
     float *ffn_up;          /* [18432, 6144] */
     float *ffn_down;        /* [6144, 18432] = (out=6144, in=18432) */
     float *output_norm;     /* [6144] */
-    float *output_w;         /* [6144, 200064] = (out=200064, in=6144) */
+    float *output_w;         /* [6144, 200064] = (I=6144, O=200064) */
+    float *token_embd;       /* [6144, 200064] = (I=6144, O=200064) */
     float *K_cache;
     float *V_cache;
     int loaded;
@@ -101,6 +102,7 @@ static void e3_load(const char *eagle_dir) {
     g_e3.ffn_down = e3_load_raw(eagle_dir, "blk.0.ffn_down.weight", D * E3_FFN_INTER);
     g_e3.output_norm = e3_load_raw(eagle_dir, "output_norm.weight", D);
     g_e3.output_w = e3_load_raw(eagle_dir, "output.weight", E3_HIDDEN * 200064);
+    g_e3.token_embd = e3_load_raw(eagle_dir, "token_embd.weight", E3_HIDDEN * 200064);
 
     g_e3.max_pos = 8192;
     g_e3.K_cache = falloc((int64_t)g_e3.max_pos * E3_KV_HEADS * E3_HEAD_DIM);
@@ -171,29 +173,34 @@ static void e3_attention(float *qkv_in, int pos, float *out, Cfg *c) {
 
 /* EAGLE3 forward: predict next token.
  * base_hidden: [6144] - hidden state from base model layer 57
- * token_embed: [6144] - embedding of the predicted token
+ * token_id: the token that was just decoded by the base model
  * pos: current position
  * logits: [vocab] - output logits
  * Returns: predicted token id */
-static int e3_forward(float *base_hidden, float *token_embed, int pos,
+static int e3_forward(float *base_hidden, int token_id, int pos,
                        float *logits, Cfg *c, Model *m) {
     int D = E3_HIDDEN;
+    /* Use EAGLE3's own token embedding */
+    float *token_embed = g_e3.token_embd + (int64_t)token_id * D;
     float *x = g_e3.scratch_x;
     float *nrm = falloc(D);
     float *attn_out = falloc(D);
     float *ffn_out = falloc(D);
 
-    /* 1. fc projection: base_hidden [6144] -> [18432] = 3 parts of 6144 */
-    float *fc_out = g_e3.fc_out_buf;
-    matmul_f(fc_out, base_hidden, g_e3.fc_w, 1, D, E3_FC_OUT);
+    /* 1. fc projection: input = [base_hidden; token_embed; prev_x] = 18432 -> 6144 */
+    float *fc_in = g_e3.fc_out_buf;  /* reuse buffer, 18432 elements */
+    /* Part 0: base_hidden (normed) */
+    rmsnorm(fc_in, base_hidden, g_e3.fc_norm[0], D, c->eps, 0);
+    /* Part 1: token_embed (normed) */
+    rmsnorm(fc_in + D, token_embed, g_e3.fc_norm[1], D, c->eps, 0);
+    /* Part 2: previous x (normed) */
+    rmsnorm(fc_in + 2*D, x, g_e3.fc_norm[2], D, c->eps, 0);
 
-    /* Normalize 3 parts */
-    rmsnorm(fc_out, fc_out, g_e3.fc_norm[0], D, c->eps, 0);
-    rmsnorm(fc_out + D, fc_out + D, g_e3.fc_norm[1], D, c->eps, 0);
-    rmsnorm(fc_out + 2*D, fc_out + 2*D, g_e3.fc_norm[2], D, c->eps, 0);
-
-    /* x = part 1 (hidden state for transformer) */
-    memcpy(x, fc_out + D, (size_t)D * sizeof(float));
+    /* fc: I=18432, O=6144 */
+    float *fc_out = falloc(D);
+    matmul_f(fc_out, fc_in, g_e3.fc_w, 1, E3_FC_OUT, D);
+    memcpy(x, fc_out, (size_t)D * sizeof(float));
+    free(fc_out);
 
     /* 2. Attention + residual */
     rmsnorm(nrm, x, g_e3.attn_norm, D, c->eps, 0);
@@ -207,7 +214,7 @@ static int e3_forward(float *base_hidden, float *token_embed, int pos,
     for (int i = 0; i < D; i++) x[i] += attn_out[i];
 
     /* 3. FFN + residual */
-    rmsnorm(nrm, x, g_e3.ffn_norm, D, c->eps, 0);
+    rmsnorm(nrm, x, g_e3.attn_norm_2, D, c->eps, 0);
     {
         float *g = falloc(E3_FFN_INTER), *u = falloc(E3_FFN_INTER), *h = falloc(D);
         /* ffn_gate: (out=18432, in=6144) */

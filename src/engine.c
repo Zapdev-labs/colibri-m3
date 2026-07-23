@@ -1593,10 +1593,7 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
             if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
                 /* Run EAGLE3 forward to fill its KV cache */
                 float *e3_logits = falloc(c->vocab);
-                float *e3_emb = falloc(D);
-                embed_tok(m, prompt[i], e3_emb);
-                e3_forward(x, e3_emb, i, e3_logits, c, m);
-                free(e3_emb);
+                e3_forward(x, prompt[i], i, e3_logits, c, m);
                 free(e3_logits);
             }
         }
@@ -1646,10 +1643,7 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
         int draft_tok = -1;
         if (g_use_mtp && g_e3.loaded && e3_has_hidden) {
             float *draft_logits = falloc(c->vocab);
-            float *e3_emb = falloc(D);
-            embed_tok(m, tok, e3_emb);
-            draft_tok = e3_forward(e3_hidden, e3_emb, pos, draft_logits, c, m);
-            free(e3_emb);
+            draft_tok = e3_forward(e3_hidden, tok, pos, draft_logits, c, m);
             free(draft_logits);
         }
 
