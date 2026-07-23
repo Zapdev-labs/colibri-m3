@@ -27,6 +27,7 @@
 #define E3_QKV_IN       6144    /* hidden state only */
 #define E3_QKV_OUT      8192    /* 64 * 128 */
 #define E3_ROPE_DIM     128
+#define E3_ROPE_THETA   5000000.0f
 #define E3_MAX_DRAFT    4
 #define E3_TARGET_LAYER 57
 #define E3_NUM_TARGET_LAYERS 3
@@ -133,8 +134,8 @@ static void e3_attention(float *qkv_in, int pos, float *out, Cfg *c) {
     matmul_f(k, qkv_in, g_e3.attn_k, 1, 12288, qkv_dim);
     matmul_f(v, qkv_in, g_e3.attn_v, 1, 12288, qkv_dim);
 
-    for (int h = 0; h < nh; h++) rope(q + (int64_t)h * hd, pos, c->theta, hd, E3_ROPE_DIM);
-    for (int h = 0; h < nkv; h++) rope(k + (int64_t)h * hd, pos, c->theta, hd, E3_ROPE_DIM);
+    for (int h = 0; h < nh; h++) rope(q + (int64_t)h * hd, pos, E3_ROPE_THETA, hd, E3_ROPE_DIM);
+    for (int h = 0; h < nkv; h++) rope(k + (int64_t)h * hd, pos, E3_ROPE_THETA, hd, E3_ROPE_DIM);
 
     int64_t kv_off = (int64_t)pos * nkv * hd;
     memcpy(g_e3.K_cache + kv_off, k, (size_t)nkv * hd * sizeof(float));
