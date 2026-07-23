@@ -345,6 +345,26 @@ static inline void kv_dequantize_i8(float *out, const int8_t *q, float scale, in
 }
 
 static void matmul_i8(float *y, const float *x, const int8_t *q, const float *sc, int S, int I, int O) {
+#if defined(__AVX512F__)
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        float scale = sc[o];
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            __m512 acc = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 16 <= I; i += 16) {
+                __m128i w8 = _mm_loadu_si128((const __m128i *)(w + i));
+                __m512 wf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(w8));
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i), wf, acc);
+            }
+            float sum = hsum512(acc);
+            for (; i < I; i++) sum += xs[i] * (float)w[i];
+            y[(int64_t)s * O + o] = sum * scale;
+        }
+    }
+#else
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
@@ -356,6 +376,7 @@ static void matmul_i8(float *y, const float *x, const int8_t *q, const float *sc
             y[(int64_t)s * O + o] = a * scale;
         }
     }
+#endif
 }
 static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *sc, int S, int I, int O) {
     int rb = (I + 1) / 2;
@@ -417,8 +438,9 @@ static void matmul_qt(float *y, const float *x, QT *w, int S) {
         if (g_use_vnni) matmul_i8_vnni(y, x, w->q8, w->s, S, w->I, w->O);
         else            matmul_i8(y, x, w->q8, w->s, S, w->I, w->O);
     } else {
-        if (g_use_vnni)      matmul_i4_vnni(y, x, w->q4, w->s, S, w->I, w->O);
-        else if (g_use_avx512_i4) matmul_i4_avx512(y, x, w->q4, w->s, S, w->I, w->O);
+        /* For int4: prefer AVX-512 FMA over VNNI (avoids activation quant overhead) */
+        if (g_use_avx512_i4) matmul_i4_avx512(y, x, w->q4, w->s, S, w->I, w->O);
+        else if (g_use_vnni) matmul_i4_vnni(y, x, w->q4, w->s, S, w->I, w->O);
         else                matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
     }
 }
