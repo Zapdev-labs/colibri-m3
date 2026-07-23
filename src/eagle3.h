@@ -29,6 +29,8 @@
 #define E3_ROPE_DIM     128
 #define E3_MAX_DRAFT    4
 #define E3_TARGET_LAYER 57
+#define E3_NUM_TARGET_LAYERS 3
+static const int E3_TARGET_LAYERS[E3_NUM_TARGET_LAYERS] = {2, 30, 57};
 
 typedef struct {
     float *fc_w;            /* [6144, 18432] = (out=6144, in=18432) */
@@ -177,7 +179,8 @@ static void e3_attention(float *qkv_in, int pos, float *out, Cfg *c) {
  * pos: current position
  * logits: [vocab] - output logits
  * Returns: predicted token id */
-static int e3_forward(float *base_hidden, int token_id, int pos,
+static int e3_forward(float *hidden_2, float *hidden_30, float *hidden_57,
+                       int token_id, int pos,
                        float *logits, Cfg *c, Model *m) {
     int D = E3_HIDDEN;
     /* Use EAGLE3's own token embedding */
@@ -187,42 +190,49 @@ static int e3_forward(float *base_hidden, int token_id, int pos,
     float *attn_out = falloc(D);
     float *ffn_out = falloc(D);
 
-    /* 1. fc projection: input = [base_hidden; token_embed; prev_x] = 18432 -> 6144 */
+    /* 1. fc projection: input = [hidden_2; hidden_30; hidden_57] = 18432 -> 6144
+     * Each chunk normed with its corresponding fc_norm */
     float *fc_in = g_e3.fc_out_buf;  /* reuse buffer, 18432 elements */
-    /* Part 0: base_hidden (normed) */
-    rmsnorm(fc_in, base_hidden, g_e3.fc_norm[0], D, c->eps, 0);
-    /* Part 1: token_embed (normed) */
-    rmsnorm(fc_in + D, token_embed, g_e3.fc_norm[1], D, c->eps, 0);
-    /* Part 2: previous x (normed) */
-    rmsnorm(fc_in + 2*D, x, g_e3.fc_norm[2], D, c->eps, 0);
-
+    rmsnorm(fc_in, hidden_2, g_e3.fc_norm[0], D, c->eps, 0);
+    rmsnorm(fc_in + D, hidden_30, g_e3.fc_norm[1], D, c->eps, 0);
+    rmsnorm(fc_in + 2*D, hidden_57, g_e3.fc_norm[2], D, c->eps, 0);
     /* fc: I=18432, O=6144 */
     float *fc_out = falloc(D);
     matmul_f(fc_out, fc_in, g_e3.fc_w, 1, E3_FC_OUT, D);
     memcpy(x, fc_out, (size_t)D * sizeof(float));
+
     free(fc_out);
 
-    /* 2. Attention + residual */
-    rmsnorm(nrm, x, g_e3.attn_norm, D, c->eps, 0);
+    /* 2. Attention + residual
+     * Python: hidden_states = hidden_norm(fc_out); input_emb = input_layernorm(token_embed)
+     *         QKV input = cat([normed_emb, normed_fc], dim=-1)
+     * Mapping: attn_norm=hidden_norm, attn_norm_2=input_layernorm */
+    float *nrm_emb = falloc(D);
+    rmsnorm(nrm, x, g_e3.attn_norm, D, c->eps, 0);       /* hidden_norm on fc_out */
+    rmsnorm(nrm_emb, token_embed, g_e3.attn_norm_2, D, c->eps, 0);  /* input_layernorm on token_embed */
     {
-        /* QKV input: [nrm; token_embed] = 12288 */
+        /* QKV input: [normed_emb; normed_fc] = 12288 */
         float *qkv_in = g_e3.qkv_in_buf;
-        memcpy(qkv_in, nrm, (size_t)D * sizeof(float));
-        memcpy(qkv_in + D, token_embed, (size_t)D * sizeof(float));
+        memcpy(qkv_in, nrm_emb, (size_t)D * sizeof(float));
+        memcpy(qkv_in + D, nrm, (size_t)D * sizeof(float));
         e3_attention(qkv_in, pos, attn_out, c);
     }
-    for (int i = 0; i < D; i++) x[i] += attn_out[i];
+    for (int i = 0; i < D; i++) x[i] += attn_out[i];  /* residual = fc_out + attn_out */
+    free(nrm_emb);
 
-    /* 3. FFN + residual */
-    rmsnorm(nrm, x, g_e3.attn_norm_2, D, c->eps, 0);
+    /* 3. FFN + residual
+     * Python: hidden_states = post_attention_layernorm(x); mlp(x)
+     * Mapping: ffn_norm = post_attention_layernorm */
+    rmsnorm(nrm, x, g_e3.ffn_norm, D, c->eps, 0);
     {
         float *g = falloc(E3_FFN_INTER), *u = falloc(E3_FFN_INTER), *h = falloc(D);
         /* ffn_gate: (out=18432, in=6144) */
         matmul_f(g, nrm, g_e3.ffn_gate, 1, D, E3_FFN_INTER);
         /* ffn_up: (out=18432, in=6144) */
         matmul_f(u, nrm, g_e3.ffn_up, 1, D, E3_FFN_INTER);
+        /* EAGLE3 uses standard SiLU, not MiniMax SwiGLU: silu(gate)*up = gate*sigmoid(gate)*up */
         for (int i = 0; i < E3_FFN_INTER; i++)
-            g[i] = swiglu(g[i], u[i], c->sw_alpha, c->sw_limit);
+            g[i] = g[i] * (1.f / (1.f + expf(-g[i]))) * u[i];
         /* ffn_down: (out=6144, in=18432) */
         matmul_f(h, g, g_e3.ffn_down, 1, E3_FFN_INTER, D);
         memcpy(ffn_out, h, (size_t)D * sizeof(float));
@@ -233,6 +243,7 @@ static int e3_forward(float *base_hidden, int token_id, int pos,
     /* 4. Output norm + EAGLE3's own output projection */
     rmsnorm(nrm, x, g_e3.output_norm, D, c->eps, 0);
     matmul_f(logits, nrm, g_e3.output_w, 1, D, 200064);
+
 
     /* 5. Greedy sample */
     int best = 0;

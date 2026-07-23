@@ -1588,13 +1588,21 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
     double t0 = now_s();
     for (int i = 0; i < np; i++) {
         embed_tok(m, prompt[i], x);
+        float e3_h0[6144], e3_h1[6144], e3_h2[6144];
+        int e3_captured = 0;
         for (int li = 0; li < c->layers; li++) {
             layer_fwd(m, li, x, 1, i, nrm, tmp);
-            if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
-                /* Run EAGLE3 forward to fill its KV cache */
-                float *e3_logits = falloc(c->vocab);
-                e3_forward(x, prompt[i], i, e3_logits, c, m);
-                free(e3_logits);
+            if (g_use_mtp && g_e3.loaded) {
+                if (li == E3_TARGET_LAYERS[0]) { memcpy(e3_h0, x, (size_t)D * sizeof(float)); e3_captured++; }
+                if (li == E3_TARGET_LAYERS[1]) { memcpy(e3_h1, x, (size_t)D * sizeof(float)); e3_captured++; }
+                if (li == E3_TARGET_LAYERS[2]) {
+                    memcpy(e3_h2, x, (size_t)D * sizeof(float)); e3_captured++;
+                    if (e3_captured == 3) {
+                        float *e3_logits = falloc(c->vocab);
+                        e3_forward(e3_h0, e3_h1, e3_h2, prompt[i], i, e3_logits, c, m);
+                        free(e3_logits);
+                    }
+                }
             }
         }
         if ((i + 1) == np || ((i + 1) % 32) == 0)
@@ -1625,7 +1633,7 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
     int emitted = 0;
     /* For EAGLE3: we need the hidden state at layer 57 (E3_TARGET_LAYER).
      * We'll capture it by modifying the forward loop to save x after layer 57. */
-    static float e3_hidden[6144];  /* captured hidden state */
+    static float e3_h0[6144], e3_h1[6144], e3_h2[6144];  /* 3 hidden states */
     int e3_has_hidden = 0;
 
     while (emitted < max_new) {
@@ -1639,27 +1647,34 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
         if (tok == c->eos) break;
         if (emitted >= max_new) break;
 
-        /* EAGLE3: draft a token using hidden state from layer 57 */
-        int draft_tok = -1;
-        if (g_use_mtp && g_e3.loaded && e3_has_hidden) {
-            float *draft_logits = falloc(c->vocab);
-            draft_tok = e3_forward(e3_hidden, tok, pos, draft_logits, c, m);
-            free(draft_logits);
-        }
-
         /* Run base model forward on tok at position pos.
-         * Capture hidden state at layer E3_TARGET_LAYER (57). */
+         * Capture hidden states at layers 2, 30, 57 (AFTER layer_fwd). */
         embed_tok(m, tok, x);
-        for (int li = 0; li < c->layers; li++) {
-            layer_fwd(m, li, x, 1, pos, nrm, tmp);
-            if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
-                memcpy(e3_hidden, x, (size_t)D * sizeof(float));
-                e3_has_hidden = 1;
+        {
+            int e3_cap = 0;
+            for (int li = 0; li < c->layers; li++) {
+                layer_fwd(m, li, x, 1, pos, nrm, tmp);
+                if (g_use_mtp && g_e3.loaded) {
+                    if (li == E3_TARGET_LAYERS[0]) { memcpy(e3_h0, x, (size_t)D * sizeof(float)); e3_cap++; }
+                    if (li == E3_TARGET_LAYERS[1]) { memcpy(e3_h1, x, (size_t)D * sizeof(float)); e3_cap++; }
+                    if (li == E3_TARGET_LAYERS[2]) { memcpy(e3_h2, x, (size_t)D * sizeof(float)); e3_cap++; }
+                }
             }
+            if (e3_cap == 3) e3_has_hidden = 1;
         }
         pos++;
         rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
         matmul_qt(logits, nrm, &m->lm_head, 1);
+
+        /* EAGLE3: draft NEXT token using hidden states from THIS position.
+         * EAGLE3 processes at position pos-1 (same as base model just did),
+         * predicts token at position pos. */
+        int draft_tok = -1;
+        if (g_use_mtp && g_e3.loaded && e3_has_hidden) {
+            float *draft_logits = falloc(c->vocab);
+            draft_tok = e3_forward(e3_h0, e3_h1, e3_h2, tok, pos - 1, draft_logits, c, m);
+            free(draft_logits);
+        }
 
         /* Check if EAGLE3 draft matches base model's prediction */
         int base_tok = sample_logits(logits, c->vocab);
@@ -1676,10 +1691,15 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
 
             /* Advance: embed base_tok, run forward to get next logits */
             embed_tok(m, base_tok, x);
-            for (int li = 0; li < c->layers; li++) {
-                layer_fwd(m, li, x, 1, pos, nrm, tmp);
-                if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
-                    memcpy(e3_hidden, x, (size_t)D * sizeof(float));
+            {
+                int e3_cap = 0;
+                for (int li = 0; li < c->layers; li++) {
+                    layer_fwd(m, li, x, 1, pos, nrm, tmp);
+                    if (g_use_mtp && g_e3.loaded) {
+                        if (li == E3_TARGET_LAYERS[0]) { memcpy(e3_h0, x, (size_t)D * sizeof(float)); e3_cap++; }
+                        if (li == E3_TARGET_LAYERS[1]) { memcpy(e3_h1, x, (size_t)D * sizeof(float)); e3_cap++; }
+                        if (li == E3_TARGET_LAYERS[2]) { memcpy(e3_h2, x, (size_t)D * sizeof(float)); e3_cap++; }
+                    }
                 }
             }
             pos++;
