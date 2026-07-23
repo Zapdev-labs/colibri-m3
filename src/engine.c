@@ -99,6 +99,7 @@ static int g_topk_samp = 40, g_planar_bits = 3;
 static int g_seed = 0;            /* 0 = time-seeded (legacy); >0 = fixed seed */
 static int g_tf_mode = 0;         /* 1 = teacher-force mode: dump top-K logprobs per position */
 static int g_moe_parallel = 0;   /* f12: 1 = parallel MoE expert dispatch */
+static int g_expert_i4 = 0;     /* convert int8 experts to int4 at load time */
 static int g_use_avx512_i4 = 0;
 static int g_use_mtp = 0;
 static const char *g_e3_dir = NULL; /* opt-in AVX-512 i4 FMA kernel (slower for memory-bound workloads) */
@@ -754,6 +755,44 @@ static void load_model(Model *m, const char *snap, int ebits, int dbits, int eca
     telem_load_complete(c->layers, c->experts, rss_kb, m->msa_layers, m->kv_i8, m->planar);
 }
 
+
+/* Convert int8 expert weights to int4 at load time.
+ * int8: q8[o*I + i] = int8, s[o] = float scale, val = q8 * s[o]
+ * int4: q4[o*I/2 + i/2] = (lo & 0xF) | (hi << 4), s4[o] = new scale
+ * Returns: malloc'd q4 buffer, caller must free. */
+static uint8_t *convert_i8_to_i4(const int8_t *q8, const float *s8, int O, int I, float **s4_out) {
+    int q4_bytes = (O * I + 1) / 2;
+    uint8_t *q4 = (uint8_t *)malloc((size_t)q4_bytes);
+    float *s4 = (float *)malloc((size_t)O * sizeof(float));
+    for (int o = 0; o < O; o++) {
+        const int8_t *row = q8 + (int64_t)o * I;
+        float scale8 = s8[o];
+        /* Find max abs value in this row (dequantized) */
+        float mx = 0;
+        for (int i = 0; i < I; i++) {
+            float v = row[i] * scale8;
+            if (fabsf(v) > mx) mx = fabsf(v);
+        }
+        /* int4 range: [-8, 7], scale = mx / 7 */
+        float new_scale = mx > 0 ? mx / 7.0f : 1e-10f;
+        float inv = 1.0f / new_scale;
+        s4[o] = new_scale;
+        /* Quantize to int4 */
+        for (int i = 0; i < I; i += 2) {
+            float v0 = row[i] * scale8 * inv;
+            float v1 = (i + 1 < I) ? row[i + 1] * scale8 * inv : 0;
+            int q0 = (int)lrintf(v0);
+            int q1 = (int)lrintf(v1);
+            if (q0 > 7) q0 = 7; if (q0 < -8) q0 = -8;
+            if (q1 > 7) q1 = 7; if (q1 < -8) q1 = -8;
+            uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+            q4[(int64_t)o * I / 2 + i / 2] = packed;
+        }
+    }
+    *s4_out = s4;
+    return q4;
+}
+
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     Cfg *c = &m->c;
     char nm[3][320], qs_nm[3][320];
@@ -771,9 +810,22 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         t->qf = NULL; t->q8 = NULL; t->q4 = NULL; t->s = NULL;
         if (st_has(&m->S, qs_nm[k])) {
             if (nb == (int64_t)O[k] * I[k]) {
-                t->fmt = 1;
-                t->q8 = (int8_t *)st_mmap_ptr(&m->S, nm[k]);
-                t->s = (float *)st_mmap_ptr(&m->S, qs_nm[k]);
+                /* int8 format - optionally convert to int4 */
+                if (g_expert_i4) {
+                    int8_t *q8_src = (int8_t *)st_mmap_ptr(&m->S, nm[k]);
+                    float *s8_src = (float *)st_mmap_ptr(&m->S, qs_nm[k]);
+                    float *s4 = NULL;
+                    uint8_t *q4 = convert_i8_to_i4(q8_src, s8_src, O[k], I[k], &s4);
+                    t->fmt = 2;
+                    t->q4 = q4;
+                    t->s = s4;
+                    /* Mark slab for freeing q4 and s4 */
+                    /* TODO: free on evict */
+                } else {
+                    t->fmt = 1;
+                    t->q8 = (int8_t *)st_mmap_ptr(&m->S, nm[k]);
+                    t->s = (float *)st_mmap_ptr(&m->S, qs_nm[k]);
+                }
             } else {
                 t->fmt = 2;
                 t->q4 = (uint8_t *)st_mmap_ptr(&m->S, nm[k]);
@@ -2085,6 +2137,7 @@ int main(int argc, char **argv) {
     /* f12: parallel MoE expert dispatch (MOE_PARALLEL=1). */
     if (getenv("MOE_PARALLEL")) g_moe_parallel = atoi(getenv("MOE_PARALLEL"));
     if (getenv("USE_AVX512_I4")) g_use_avx512_i4 = atoi(getenv("USE_AVX512_I4"));
+    if (getenv("EXPERT_I4")) g_expert_i4 = atoi(getenv("EXPERT_I4"));
     if (getenv("USE_MTP")) g_use_mtp = atoi(getenv("USE_MTP"));
     g_e3_dir = getenv("E3_DIR");
     /* f10: NUMA topology discovery + optional thread pinning. */
