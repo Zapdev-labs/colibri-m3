@@ -23,8 +23,8 @@
 #define E3_HEAD_DIM     128
 #define E3_KV_HEADS     64
 #define E3_FFN_INTER    18432
-#define E3_FC_IN        18432   /* 3 * 6144 */
-#define E3_QKV_IN       12288   /* 2 * 6144 */
+#define E3_FC_OUT       18432   /* 3 * 6144 */
+#define E3_QKV_IN       6144    /* hidden state only */
 #define E3_QKV_OUT      8192    /* 64 * 128 */
 #define E3_ROPE_DIM     128
 #define E3_MAX_DRAFT    4
@@ -50,8 +50,8 @@ typedef struct {
     int loaded;
     int max_pos;
     float *scratch_x;       /* [6144] */
-    float *fc_in_buf;       /* [18432] */
     float *qkv_in_buf;      /* [12288] */
+    float *fc_out_buf;      /* [18432] */
 } Eagle3State;
 
 static Eagle3State g_e3;
@@ -78,15 +78,22 @@ static void e3_load(const char *eagle_dir) {
     memset(&g_e3, 0, sizeof(g_e3));
 
     int D = E3_HIDDEN;
-    g_e3.fc_w = e3_load_raw(eagle_dir, "fc.weight", D * E3_FC_IN);
+    /* fc: GGUF [18432, 6144] → saved as (18432, 6144) = out=18432, in=6144 */
+    g_e3.fc_w = e3_load_raw(eagle_dir, "fc.weight", E3_FC_OUT * D);
     g_e3.fc_norm[0] = e3_load_raw(eagle_dir, "fc_norm.0.weight", D);
     g_e3.fc_norm[1] = e3_load_raw(eagle_dir, "fc_norm.1.weight", D);
     g_e3.fc_norm[2] = e3_load_raw(eagle_dir, "fc_norm.2.weight", D);
     g_e3.attn_norm = e3_load_raw(eagle_dir, "blk.0.attn_norm.weight", D);
     g_e3.attn_norm_2 = e3_load_raw(eagle_dir, "blk.0.attn_norm_2.weight", D);
-    g_e3.attn_q = e3_load_raw(eagle_dir, "blk.0.attn_q.weight", E3_QKV_OUT * E3_QKV_IN);
-    g_e3.attn_k = e3_load_raw(eagle_dir, "blk.0.attn_k.weight", E3_QKV_OUT * E3_QKV_IN);
-    g_e3.attn_v = e3_load_raw(eagle_dir, "blk.0.attn_v.weight", E3_QKV_OUT * E3_QKV_IN);
+    /* Q/K/V: GGUF [12288, 8192] → saved as (8192, 12288) but we need to use
+     * the transposed interpretation: out=12288, in=8192 is wrong.
+     * Actually GGUF ne[0]=12288 is n_embd (input), ne[1]=8192 is n_rows (output)
+     * So the matrix is (8192 rows, 12288 cols) = out=8192, in=12288
+     * But our dequant saved it as (8192, 12288) row-major = out=8192, in=12288
+     * This means QKV input IS 12288 = 2*6144 */
+    g_e3.attn_q = e3_load_raw(eagle_dir, "blk.0.attn_q.weight", E3_QKV_OUT * 12288);
+    g_e3.attn_k = e3_load_raw(eagle_dir, "blk.0.attn_k.weight", E3_QKV_OUT * 12288);
+    g_e3.attn_v = e3_load_raw(eagle_dir, "blk.0.attn_v.weight", E3_QKV_OUT * 12288);
     g_e3.attn_output = e3_load_raw(eagle_dir, "blk.0.attn_output.weight", D * E3_QKV_OUT);
     g_e3.ffn_norm = e3_load_raw(eagle_dir, "blk.0.ffn_norm.weight", D);
     g_e3.ffn_gate = e3_load_raw(eagle_dir, "blk.0.ffn_gate.weight", E3_FFN_INTER * D);
@@ -102,8 +109,8 @@ static void e3_load(const char *eagle_dir) {
     memset(g_e3.V_cache, 0, (size_t)g_e3.max_pos * E3_KV_HEADS * E3_HEAD_DIM * sizeof(float));
 
     g_e3.scratch_x = falloc(D);
-    g_e3.fc_in_buf = falloc(E3_FC_IN);
-    g_e3.qkv_in_buf = falloc(E3_QKV_IN);
+    g_e3.fc_out_buf = falloc(E3_FC_OUT);
+    g_e3.qkv_in_buf = falloc(12288);
 
     g_e3.loaded = 1;
     fprintf(stderr, "[e3] loaded: 1 layer, %d heads, head_dim=%d, ffn=%d\n",
@@ -117,10 +124,10 @@ static void e3_attention(float *qkv_in, int pos, float *out, Cfg *c) {
     float scale = 1.f / sqrtf((float)hd);
 
     float *q = falloc(qkv_dim), *k = falloc(qkv_dim), *v = falloc(qkv_dim);
-    /* Q/K/V: (out=8192, in=12288) */
-    matmul_f(q, qkv_in, g_e3.attn_q, 1, E3_QKV_IN, qkv_dim);
-    matmul_f(k, qkv_in, g_e3.attn_k, 1, E3_QKV_IN, qkv_dim);
-    matmul_f(v, qkv_in, g_e3.attn_v, 1, E3_QKV_IN, qkv_dim);
+    /* Q/K/V: out=8192, in=12288 */
+    matmul_f(q, qkv_in, g_e3.attn_q, 1, 12288, qkv_dim);
+    matmul_f(k, qkv_in, g_e3.attn_k, 1, 12288, qkv_dim);
+    matmul_f(v, qkv_in, g_e3.attn_v, 1, 12288, qkv_dim);
 
     for (int h = 0; h < nh; h++) rope(q + (int64_t)h * hd, pos, c->theta, hd, E3_ROPE_DIM);
     for (int h = 0; h < nkv; h++) rope(k + (int64_t)h * hd, pos, c->theta, hd, E3_ROPE_DIM);
@@ -176,24 +183,27 @@ static int e3_forward(float *base_hidden, float *token_embed, int pos,
     float *attn_out = falloc(D);
     float *ffn_out = falloc(D);
 
-    /* 1. Build fc input: [base_hidden; token_embed; prev_x] = 18432 */
-    float *fc_in = g_e3.fc_in_buf;
-    rmsnorm(fc_in, base_hidden, g_e3.fc_norm[0], D, c->eps, 0);
-    rmsnorm(fc_in + D, token_embed, g_e3.fc_norm[1], D, c->eps, 0);
-    rmsnorm(fc_in + 2*D, x, g_e3.fc_norm[2], D, c->eps, 0);
+    /* 1. fc projection: base_hidden [6144] -> [18432] = 3 parts of 6144 */
+    float *fc_out = g_e3.fc_out_buf;
+    matmul_f(fc_out, base_hidden, g_e3.fc_w, 1, D, E3_FC_OUT);
 
-    /* fc: (out=6144, in=18432) → produces new hidden state */
-    float *new_x = falloc(D);
-    matmul_f(new_x, fc_in, g_e3.fc_w, 1, E3_FC_IN, D);
-    memcpy(x, new_x, (size_t)D * sizeof(float));
-    free(new_x);
+    /* Normalize 3 parts */
+    rmsnorm(fc_out, fc_out, g_e3.fc_norm[0], D, c->eps, 0);
+    rmsnorm(fc_out + D, fc_out + D, g_e3.fc_norm[1], D, c->eps, 0);
+    rmsnorm(fc_out + 2*D, fc_out + 2*D, g_e3.fc_norm[2], D, c->eps, 0);
 
-    /* 2. Build QKV input: [x; token_embed] = 12288 */
-    float *qkv_in = g_e3.qkv_in_buf;
-    rmsnorm(qkv_in, x, g_e3.attn_norm, D, c->eps, 0);
-    memcpy(qkv_in + D, token_embed, (size_t)D * sizeof(float));
-    e3_attention(qkv_in, pos, attn_out, c);
-    rmsnorm(attn_out, attn_out, g_e3.attn_norm_2, D, c->eps, 0);
+    /* x = part 1 (hidden state for transformer) */
+    memcpy(x, fc_out + D, (size_t)D * sizeof(float));
+
+    /* 2. Attention + residual */
+    rmsnorm(nrm, x, g_e3.attn_norm, D, c->eps, 0);
+    {
+        /* QKV input: [nrm; token_embed] = 12288 */
+        float *qkv_in = g_e3.qkv_in_buf;
+        memcpy(qkv_in, nrm, (size_t)D * sizeof(float));
+        memcpy(qkv_in + D, token_embed, (size_t)D * sizeof(float));
+        e3_attention(qkv_in, pos, attn_out, c);
+    }
     for (int i = 0; i < D; i++) x[i] += attn_out[i];
 
     /* 3. FFN + residual */
