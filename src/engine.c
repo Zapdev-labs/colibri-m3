@@ -99,7 +99,9 @@ static int g_topk_samp = 40, g_planar_bits = 3;
 static int g_seed = 0;            /* 0 = time-seeded (legacy); >0 = fixed seed */
 static int g_tf_mode = 0;         /* 1 = teacher-force mode: dump top-K logprobs per position */
 static int g_moe_parallel = 0;   /* f12: 1 = parallel MoE expert dispatch */
-static int g_use_avx512_i4 = 0; /* opt-in AVX-512 i4 FMA kernel (slower for memory-bound workloads) */
+static int g_use_avx512_i4 = 0;
+static int g_use_mtp = 0;
+static const char *g_e3_dir = NULL; /* opt-in AVX-512 i4 FMA kernel (slower for memory-bound workloads) */
 static int g_bench_mode = 0;     /* f13: 1 = native C benchmark mode (per-token timing + JSON summary) */
 static NumaTopo g_numa;          /* f10: discovered NUMA topology (zeroed until numa_discover) */
 static int g_tf_topk = 200;       /* top-K logprobs to dump per TF position (matches oracle) */
@@ -1435,6 +1437,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     if (S * K > 64) { free(idxs); free(ws); }
 }
 
+#include "eagle3.h"
+
 static void layer_fwd(Model *m, int li, float *x, int S, int pos0, float *nrm, float *tmp) {
     Layer *l = &m->L[li];
     Cfg *c = &m->c;
@@ -1584,13 +1588,36 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
     double t0 = now_s();
     for (int i = 0; i < np; i++) {
         embed_tok(m, prompt[i], x);
-        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, i, nrm, tmp);
+        for (int li = 0; li < c->layers; li++) {
+            layer_fwd(m, li, x, 1, i, nrm, tmp);
+            if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
+                /* Run EAGLE3 forward to fill its KV cache */
+                float *e3_logits = falloc(c->vocab);
+                float *e3_emb = falloc(D);
+                embed_tok(m, prompt[i], e3_emb);
+                e3_forward(x, e3_emb, i, e3_logits, c, m);
+                free(e3_emb);
+                free(e3_logits);
+            }
+        }
         if ((i + 1) == np || ((i + 1) % 32) == 0)
             fprintf(stderr, "\r[bench-prefill] %d/%d", i + 1, np);
     }
     fprintf(stderr, "\n[bench-prefill] done in %.2fs\n", now_s() - t0);
     rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
     matmul_qt(logits, nrm, &m->lm_head, 1);
+
+    /* EAGLE3 prefill: run e3_forward for each prompt position to fill KV cache */
+    if (g_use_mtp && g_e3.loaded) {
+        fprintf(stderr, "[e3] prefilling KV cache for %d tokens...\n", np);
+        /* We need the hidden state at layer 57 for each prompt position.
+         * But we already ran the full model. We can use the final hidden state
+         * as an approximation, or re-run. For now, just clear the KV cache
+         * and let EAGLE3 attend only to decode positions. */
+        memset(g_e3.K_cache, 0, (size_t)g_e3.max_pos * E3_KV_HEADS * E3_HEAD_DIM * sizeof(float));
+        memset(g_e3.V_cache, 0, (size_t)g_e3.max_pos * E3_KV_HEADS * E3_HEAD_DIM * sizeof(float));
+        fprintf(stderr, "[e3] KV cache cleared\n");
+    }
 
     /* bench mode: always greedy (TEMP=0) to isolate decode timing */
     g_temp = 0.0f; g_topp = 0.0f; g_topk_samp = 0;
@@ -1599,26 +1626,83 @@ static int run_bench(Model *m, const int *prompt, int np, int max_new) {
     t0 = now_s();
     double *step_times = (double *)malloc((size_t)max_new * sizeof(double));
     int emitted = 0;
-    for (int t = 0; t < max_new; t++) {
+    /* For EAGLE3: we need the hidden state at layer 57 (E3_TARGET_LAYER).
+     * We'll capture it by modifying the forward loop to save x after layer 57. */
+    static float e3_hidden[6144];  /* captured hidden state */
+    int e3_has_hidden = 0;
+
+    while (emitted < max_new) {
         double step_t0 = now_s();
+
+        /* Greedy decode from current logits */
         int tok = sample_logits(logits, c->vocab);
         printf("%d\n", tok);
         fflush(stdout);
         emitted++;
         if (tok == c->eos) break;
+        if (emitted >= max_new) break;
+
+        /* EAGLE3: draft a token using hidden state from layer 57 */
+        int draft_tok = -1;
+        if (g_use_mtp && g_e3.loaded && e3_has_hidden) {
+            float *draft_logits = falloc(c->vocab);
+            float *e3_emb = falloc(D);
+            embed_tok(m, tok, e3_emb);
+            draft_tok = e3_forward(e3_hidden, e3_emb, pos, draft_logits, c, m);
+            free(e3_emb);
+            free(draft_logits);
+        }
+
+        /* Run base model forward on tok at position pos.
+         * Capture hidden state at layer E3_TARGET_LAYER (57). */
         embed_tok(m, tok, x);
-        for (int li = 0; li < c->layers; li++) layer_fwd(m, li, x, 1, pos, nrm, tmp);
+        for (int li = 0; li < c->layers; li++) {
+            layer_fwd(m, li, x, 1, pos, nrm, tmp);
+            if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
+                memcpy(e3_hidden, x, (size_t)D * sizeof(float));
+                e3_has_hidden = 1;
+            }
+        }
         pos++;
         rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
         matmul_qt(logits, nrm, &m->lm_head, 1);
+
+        /* Check if EAGLE3 draft matches base model's prediction */
+        int base_tok = sample_logits(logits, c->vocab);
+        if (draft_tok >= 0) fprintf(stderr, "[e3] draft=%d base=%d pos=%d\n", draft_tok, base_tok, pos);
+        int accepted = 0;
+
+        if (draft_tok >= 0 && draft_tok == base_tok) {
+            /* Accepted! Emit draft token for free. */
+            printf("%d\n", draft_tok);
+            fflush(stdout);
+            emitted++;
+            accepted = 1;
+            if (draft_tok == c->eos) break;
+
+            /* Advance: embed base_tok, run forward to get next logits */
+            embed_tok(m, base_tok, x);
+            for (int li = 0; li < c->layers; li++) {
+                layer_fwd(m, li, x, 1, pos, nrm, tmp);
+                if (g_use_mtp && g_e3.loaded && li == E3_TARGET_LAYER) {
+                    memcpy(e3_hidden, x, (size_t)D * sizeof(float));
+                }
+            }
+            pos++;
+            rmsnorm(nrm, x, m->final_norm, D, c->eps, c->gemma_norm);
+            matmul_qt(logits, nrm, &m->lm_head, 1);
+        }
+
         double step_dt = now_s() - step_t0;
-        step_times[t] = step_dt;
-        double rolling = (t + 1) / (now_s() - t0);
+        if (emitted - 1 < max_new) step_times[emitted - 1] = step_dt;
+        double rolling = emitted / (now_s() - t0);
         uint64_t tot = m->hits + m->miss;
-        fprintf(stderr, "[bench] tok %d: decode_ms=%.1f rolling_tokps=%.2f hit=%lu/%lu\n",
-                t, step_dt * 1000.0, rolling,
-                (unsigned long)m->hits, (unsigned long)(tot));
+        fprintf(stderr, "[bench] tok %d: decode_ms=%.1f rolling_tokps=%.2f hit=%lu/%lu e3=%d accept=%d\n",
+                emitted - 1, step_dt * 1000.0, rolling,
+                (unsigned long)m->hits, (unsigned long)(tot),
+                draft_tok >= 0 ? 1 : 0, accepted);
     }
+
     double dt = now_s() - t0;
     double tokps = emitted / (dt > 1e-6 ? dt : 1e-6);
     /* warm = last 50% of tokens */
@@ -1985,6 +2069,8 @@ int main(int argc, char **argv) {
     /* f12: parallel MoE expert dispatch (MOE_PARALLEL=1). */
     if (getenv("MOE_PARALLEL")) g_moe_parallel = atoi(getenv("MOE_PARALLEL"));
     if (getenv("USE_AVX512_I4")) g_use_avx512_i4 = atoi(getenv("USE_AVX512_I4"));
+    if (getenv("USE_MTP")) g_use_mtp = atoi(getenv("USE_MTP"));
+    g_e3_dir = getenv("E3_DIR");
     /* f10: NUMA topology discovery + optional thread pinning. */
     numa_discover(&g_numa);
     /* Parse env vars AFTER numa_discover (which sets defaults) so they override. */
@@ -2016,6 +2102,7 @@ int main(int argc, char **argv) {
 
     Model m;
     load_model(&m, snap, ebits, dbits, cap, ctx);
+    if (g_use_mtp) e3_load(g_e3_dir);
     fprintf(stderr, "READY\n");
 
     /* stdin protocol: first line = max_new, second line = space-separated prompt token ids.
