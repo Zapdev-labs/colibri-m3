@@ -112,7 +112,7 @@ static void e3_load(const char *eagle_dir) {
     memset(g_e3.K_cache, 0, (size_t)g_e3.max_pos * E3_KV_HEADS * E3_HEAD_DIM * sizeof(float));
     memset(g_e3.V_cache, 0, (size_t)g_e3.max_pos * E3_KV_HEADS * E3_HEAD_DIM * sizeof(float));
 
-    g_e3.scratch_x = falloc(D);
+    g_e3.scratch_x = (float *)calloc(D, sizeof(float));
     g_e3.fc_out_buf = falloc(E3_FC_OUT);
     g_e3.qkv_in_buf = falloc(12288);
 
@@ -243,6 +243,11 @@ static int e3_forward(float *hidden_2, float *hidden_30, float *hidden_57,
     /* 4. Output norm + EAGLE3's own output projection */
     rmsnorm(nrm, x, g_e3.output_norm, D, c->eps, 0);
     matmul_f(logits, nrm, g_e3.output_w, 1, D, 200064);
+    { float mx=-1e30f; int mi=-1;
+      for(int i=0;i<200064;i++) if(logits[i]>mx){mx=logits[i];mi=i;}
+      /* Check logit for the input token vs the best */
+      float in_logit = logits[token_id];
+    }
 
 
     /* 5. Greedy sample */
